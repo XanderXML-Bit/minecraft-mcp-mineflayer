@@ -713,37 +713,42 @@ async function craftItems(params: Record<string, unknown>) {
     }
   }
 
-  let crafted = 0; const errors: string[] = [];
+  const errors: string[] = [];
   const deadline = Date.now() + Number((params as any).maxMs ?? 60000);
   let reason: string | undefined;
+
+  const invCountByName = (n: string) => bot.inventory.items().filter(i => i.name === n).reduce((a, b) => a + b.count, 0);
+  const countBefore = invCountByName(item.name);
+  let crafted = 0;
+
   while (crafted < count && Date.now() < deadline) {
-    const remaining = count - crafted;
-    const { craftable, missing } = computeMaxCraftable(remaining);
-    if (craftable <= 0) { reason = 'missing_resources'; errors.push('missing resources'); break; }
     try {
-      await craftWithTimeout(craftable);
-      crafted += craftable;
-      continue;
-    } catch (e: any) {
-      errors.push(String(e?.message || e));
-      if ((e && String(e.message).includes('timeout')) || String(e).includes('craft_timeout')) {
-        reason = 'craft_timeout';
-      }
-      // Try one-by-one with small timeout to salvage
-      try {
-        await craftWithTimeout(1, 8000);
-        crafted += 1;
-      } catch (e2: any) {
-        errors.push(String(e2?.message || e2));
-        if (!reason && missing && missing.length > 0) reason = 'missing_resources';
+      await craftWithTimeout(1, 8000);
+      await bot.waitForTicks(2);
+      const now = invCountByName(item.name);
+      const delta = Math.max(0, now - (countBefore + crafted));
+      if (delta <= 0) {
+        errors.push('no_output_from_craft');
+        reason = reason || 'unknown';
         break;
       }
+      crafted += delta;
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      errors.push(msg);
+      if (msg.includes('timeout') || msg.includes('craft_timeout')) {
+        reason = 'craft_timeout';
+      } else {
+        reason = reason || 'missing_resources';
+      }
+      break;
     }
-    await bot.waitForTicks(1);
   }
   const timedOut = Date.now() >= deadline && crafted < count;
   if (!reason && recipeNeedsTable && !tableBlock) reason = 'missing_table';
-  return { ok: crafted > 0, requested: count, crafted, remaining: Math.max(0, count - crafted), usedTable: !!tableBlock, timedOut, reason, missingItems: reason === 'missing_resources' ? computeMissingFor(count - crafted || 1) : [], errors };
+  // Always compute missing for visibility if we didn't craft everything
+  const missingItems = crafted < count ? computeMissingFor(Math.max(1, count - crafted)) : [];
+  return { ok: crafted > 0, requested: count, crafted, remaining: Math.max(0, count - crafted), usedTable: !!tableBlock, timedOut, reason, missingItems, errors };
 }
 
 // List recipes for a specific item and whether they are currently craftable
