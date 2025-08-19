@@ -644,29 +644,77 @@ async function craftItems(params: Record<string, unknown>) {
     }
   }
 
+  function computeMaxCraftable(unitsLimit: number): { craftable: number; missing: Array<{ id: number; name: string; count: number }> } {
+    try {
+      const invMap: Record<number, number> = {};
+      for (const it of bot.inventory.items()) invMap[it.type] = (invMap[it.type] || 0) + it.count;
+      const r: any = recipe as any;
+      const perUnitReq: Record<number, number> = {};
+      if (Array.isArray(r.ingredients)) {
+        for (const ing of r.ingredients) {
+          if (!ing) continue; const id = Number(ing.id); const c = Number(ing.count ?? 1);
+          perUnitReq[id] = (perUnitReq[id] || 0) + c;
+        }
+      }
+      if (Array.isArray(r.inShape)) {
+        for (const row of r.inShape) { if (!Array.isArray(row)) continue; for (const cell of row) { if (!cell) continue; const id = Number(cell.id); perUnitReq[id] = (perUnitReq[id] || 0) + 1; } }
+      }
+      let max = Number.isFinite(unitsLimit) ? unitsLimit : 64;
+      for (const idStr of Object.keys(perUnitReq)) {
+        const id = Number(idStr); const needPer = perUnitReq[id]; const have = invMap[id] || 0;
+        max = Math.min(max, Math.floor(have / needPer));
+      }
+      const missing: Array<{ id: number; name: string; count: number }> = [];
+      if (max <= 0) {
+        for (const idStr of Object.keys(perUnitReq)) {
+          const id = Number(idStr); const needPer = perUnitReq[id]; const have = invMap[id] || 0; if (have < needPer) {
+            const name = (mcData.items[id]?.name) || String(id); missing.push({ id, name, count: needPer - have });
+          }
+        }
+      }
+      return { craftable: Math.max(0, Math.min(max, unitsLimit)), missing };
+    } catch {
+      return { craftable: 0, missing: [] };
+    }
+  }
+
+  async function craftWithTimeout(amount: number, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      // mineflayer doesn't support AbortSignal; use race
+      await Promise.race([
+        bot.craft(recipe, amount, tableBlock || null),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('craft_timeout')), timeoutMs))
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   let crafted = 0; const errors: string[] = [];
   const deadline = Date.now() + Number((params as any).maxMs ?? 60000);
   let reason: string | undefined;
   while (crafted < count && Date.now() < deadline) {
     const remaining = count - crafted;
+    const { craftable, missing } = computeMaxCraftable(remaining);
+    if (craftable <= 0) { reason = 'missing_resources'; errors.push('missing resources'); break; }
     try {
-      await bot.craft(recipe, remaining, tableBlock || null);
-      crafted += remaining;
-      break;
+      await craftWithTimeout(craftable);
+      crafted += craftable;
+      continue;
     } catch (e: any) {
       errors.push(String(e?.message || e));
-      const missing = computeMissingFor(remaining);
-      if (missing.length > 0) reason = 'missing_resources';
-      // Try to craft one at a time to salvage progress
+      if ((e && String(e.message).includes('timeout')) || String(e).includes('craft_timeout')) {
+        reason = 'craft_timeout';
+      }
+      // Try one-by-one with small timeout to salvage
       try {
-        await bot.craft(recipe, 1, tableBlock || null);
+        await craftWithTimeout(1, 8000);
         crafted += 1;
       } catch (e2: any) {
         errors.push(String(e2?.message || e2));
-        if (!reason) {
-          const miss1 = computeMissingFor(1);
-          if (miss1.length > 0) reason = 'missing_resources';
-        }
+        if (!reason && missing && missing.length > 0) reason = 'missing_resources';
         break;
       }
     }
@@ -675,6 +723,48 @@ async function craftItems(params: Record<string, unknown>) {
   const timedOut = Date.now() >= deadline && crafted < count;
   if (!reason && recipeNeedsTable && !tableBlock) reason = 'missing_table';
   return { ok: crafted > 0, requested: count, crafted, remaining: Math.max(0, count - crafted), usedTable: !!tableBlock, timedOut, reason, missingItems: reason === 'missing_resources' ? computeMissingFor(count - crafted || 1) : [], errors };
+}
+
+// List recipes for a specific item and whether they are currently craftable
+async function listRecipes(params: Record<string, unknown>) {
+  const bot = getBotOrThrow(String(params.username || ""));
+  const itemName = String(params.itemName || params.name || '');
+  if (!itemName) throw new Error('itemName required');
+  const mcDataMod = await import('minecraft-data');
+  const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
+  const item = mcData.itemsByName[itemName];
+  if (!item) throw new Error(`Unknown item ${itemName}`);
+  const tableBlock: any = bot.findBlock({ matching: (b: any) => b?.name === 'crafting_table', maxDistance: 16 }) || null;
+  const recipes = [
+    ...bot.recipesFor(item.id, null, 1, null),
+    ...(tableBlock ? bot.recipesFor(item.id, null, 1, tableBlock) : [])
+  ];
+  const unique = new Set<any>();
+  const out: any[] = [];
+  const invMap: Record<number, number> = {};
+  for (const it of bot.inventory.items()) invMap[it.type] = (invMap[it.type] || 0) + it.count;
+  for (const r of recipes) {
+    if (unique.has(r)) continue; unique.add(r);
+    const rec: any = r as any;
+    const requiresTable = !!rec.requiresTable;
+    const ingList: Array<{ id: number; name: string; count: number }> = [];
+    const perUnitReq: Record<number, number> = {};
+    if (Array.isArray(rec.ingredients)) {
+      for (const ing of rec.ingredients) { if (!ing) continue; const id = Number(ing.id); const c = Number(ing.count ?? 1); perUnitReq[id] = (perUnitReq[id] || 0) + c; }
+    }
+    if (Array.isArray(rec.inShape)) {
+      for (const row of rec.inShape) { if (!Array.isArray(row)) continue; for (const cell of row) { if (!cell) continue; const id = Number(cell.id); perUnitReq[id] = (perUnitReq[id] || 0) + 1; } }
+    }
+    for (const idStr of Object.keys(perUnitReq)) {
+      const id = Number(idStr); const name = (mcData.items[id]?.name) || String(id); const cnt = perUnitReq[id]; ingList.push({ id, name, count: cnt });
+    }
+    // estimate craftable units with current inventory
+    let max = 64;
+    for (const idStr of Object.keys(perUnitReq)) { const id = Number(idStr); const need = perUnitReq[id]; const have = invMap[id] || 0; max = Math.min(max, Math.floor(have / need)); }
+    const craftable = Math.max(0, max);
+    out.push({ item: { id: item.id, name: item.name }, requiresTable, ingredients: ingList, craftable });
+  }
+  return { ok: true, item: item.name, recipes: out };
 }
 
 // ---- Cooking/Smelting helpers ----
@@ -1310,6 +1400,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "harvestMatureCrops": action = await harvestMatureCrops(args); break;
       case "pickupItem": action = await pickupItem(args); break;
       case "craftItems": action = await craftItems(args); break;
+      case "listRecipes": action = await listRecipes(args); break;
       case "cookItem": action = await cookItem(args); break;
       case "smeltItem": action = await smeltItem(args); break;
       case "cookWithSmoker": action = await cookWithSmoker(args); break;
@@ -1387,6 +1478,7 @@ function listTools() {
     ,{ name: "harvestMatureCrops", description: "Harvest mature crops from farmland", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" } } } }
     ,{ name: "pickupItem", description: "Pick up items from the ground", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } } } }
     ,{ name: "craftItems", description: "Craft items using a crafting table", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, count: { type: "number" } }, required: ["itemName"] } }
+    ,{ name: "listRecipes", description: "List recipes for an item and how many are craftable with current inventory", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "cookItem", description: "Cook items in a furnace", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "smeltItem", description: "Smelt items in a furnace", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "cookWithSmoker", description: "Cook items in a smoker (optimized for food)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }

@@ -46,7 +46,7 @@ Toggle the MCP in Cursor’s settings.
 - attackSomeone (uses bow at range when bow+arrows available, melee otherwise), hunt, stopAttack, selfDefense
   - Bow is used automatically when the target is > 8 blocks and bow+arrows are present; otherwise melee.
 - mineResource, harvestMatureCrops, pickupItem
-- craftItems
+- craftItems, listRecipes
 - smeltItem/cookItem (auto device selection: smoker/blast furnace/furnace; prefers smoker for food, blast furnace for ores)
 - cookWithSmoker, smeltWithBlastFurnace, cookWithCampfire, retrieveItemsFromNearbyFurnace
 - openInventory, listInventory, equipItem (destination: hand/off-hand/head/torso/legs/feet), dropItem, giveItemToSomeone
@@ -62,7 +62,15 @@ Toggle the MCP in Cursor’s settings.
 {"name":"smeltItem","arguments":{"username":"Zen","itemName":"iron_ore"}}
 {"name":"cookWithSmoker","arguments":{"username":"Zen","itemName":"beef"}}
 {"name":"equipItem","arguments":{"username":"Zen","name":"iron_helmet","destination":"head"}}
+{"name":"listRecipes","arguments":{"username":"Zen","itemName":"stone_pickaxe"}}
+{"name":"craftItems","arguments":{"username":"Zen","itemName":"stone_pickaxe","count":1,"maxMs":60000}}
 ```
+
+### Crafting details
+- listRecipes: returns per-recipe ingredients, whether a crafting table is required, and how many units are currently craftable with the bot’s inventory.
+- craftItems: auto-finds/places a crafting table if needed, moves into range, crafts up to `count`, and returns partial-progress and diagnostics:
+  - Fields include: `requested`, `crafted`, `remaining`, `usedTable`, `timedOut`, `reason` (`missing_resources` | `missing_table` | undefined), `missingItems` (when resources are missing), and `errors`.
+  - You may set `maxMs` to bound total crafting time; the tool also uses small per-batch timeouts to avoid stalling.
 
 ### Notes
 - Bow shots require a bow and arrows; otherwise melee is used. The ranged threshold is 8 blocks (fixed).
