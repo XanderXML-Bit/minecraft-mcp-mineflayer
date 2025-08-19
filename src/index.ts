@@ -42,15 +42,21 @@ function getBotOrThrow(username?: string): Bot {
 }
 
 // Helpers
-async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, maxDistance = 32, range = 1) {
+async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, maxDistance = 32, range = 1, timeoutMs = 45000) {
   const block = bot.findBlock({ matching: (b: any) => !!b && predicate(b), maxDistance });
   if (!block) throw new Error('Target not found nearby');
   const p: any = (block as any).position || block;
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, range));
-  // give it a moment to walk
-  await bot.waitForTicks(20);
+  // wait until close enough or timeout
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const dist = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z));
+    if (dist <= Math.max(1, range) + 0.5) break;
+    await bot.waitForTicks(5);
+  }
+  if (Date.now() - start >= timeoutMs) throw new Error('navigation_timeout');
   return block as any;
 }
 
@@ -455,17 +461,27 @@ async function mineResource(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   const blockName = String(params.blockName || params.resource || 'stone');
   const count = Number(params.count ?? 1);
+  const maxMs = Number((params as any).maxMs ?? 120000);
   const mcDataMod = await import('minecraft-data');
   const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
   const candidates = resolveBlockAliases(blockName, mcData);
   const positions = bot.findBlocks({ matching: (b: any) => b && candidates.includes(b.name), maxDistance: 64, count });
   if (!positions.length) throw new Error(`No ${blockName} nearby`);
   const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
+  let completed = 0;
+  const start = Date.now();
   for (const b of blocks) {
-    // @ts-ignore
-    await bot.collectBlock.collect(b);
+    if (Date.now() - start > maxMs) break;
+    try {
+      // @ts-ignore
+      await bot.collectBlock.collect(b);
+      completed++;
+    } catch (e) {
+      // continue to next block, record failure context
+    }
   }
-  return { ok: true };
+  const timedOut = Date.now() - start > maxMs;
+  return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), timedOut };
 }
 
 async function harvestMatureCrops(params: Record<string, unknown>) {
@@ -483,11 +499,22 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
   });
   if (!positions.length) throw new Error('No mature crops found');
   const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
+  let harvested = 0; const failed: Array<{x:number,y:number,z:number}> = [];
+  const maxMs = Number((params as any).maxMs ?? 90000);
+  const start = Date.now();
   for (const b of blocks) {
-    // @ts-ignore
-    await bot.collectBlock.collect(b);
+    if (Date.now() - start > maxMs) break;
+    try {
+      // @ts-ignore
+      await bot.collectBlock.collect(b);
+      harvested++;
+    } catch {
+      const p: any = (b as any).position || b;
+      failed.push({ x: p.x, y: p.y, z: p.z });
+    }
   }
-  return { ok: true, harvested: blocks.length };
+  const timedOut = Date.now() - start > maxMs;
+  return { ok: harvested > 0, harvested, failed, timedOut };
 }
 
 async function pickupItem(params: Record<string, unknown>) {
@@ -498,13 +525,16 @@ async function pickupItem(params: Record<string, unknown>) {
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalFollow(ent, 1));
-  // wait up to 5 seconds to pick up
+  // wait up to 20 seconds to pick up and report partial
   const start = Date.now();
-  while (Date.now() - start < 5000) {
+  const maxMs = Number((params as any).maxMs ?? 20000);
+  let pickedUp = false;
+  while (Date.now() - start < maxMs) {
     await bot.waitForTicks(5);
-    if (!bot.nearestEntity((e: any) => e.id === ent.id)) break;
+    if (!bot.nearestEntity((e: any) => e.id === ent.id)) { pickedUp = true; break; }
   }
-  return { ok: true };
+  const timedOut = Date.now() - start >= maxMs;
+  return { ok: pickedUp, pickedUp, timedOut };
 }
 
 async function openNearbyChest(params: Record<string, unknown>) {
@@ -512,8 +542,9 @@ async function openNearbyChest(params: Record<string, unknown>) {
   const pos = await pathfindToPredicate(bot, (b: any) => b?.name?.includes('chest'), 24, 2);
   const chest = await bot.openChest(pos as any);
   await bot.waitForTicks(10);
+  const items = chest.containerItems().map((i: any) => ({ name: i.name, count: i.count }));
   chest.close();
-  return { ok: true };
+  return { ok: true, chestItems: items };
 }
 
 async function craftItems(params: Record<string, unknown>) {
@@ -591,17 +622,18 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
       if (!fuel) throw new Error('Missing fuel');
       await furnace.putFuel(fuel.type, null, 1);
     }
-    // Wait up to 60s for an output
+    // Wait up to 90s for an output
     const start = Date.now();
     let out: any = null;
-    while (Date.now() - start < 60000) {
+    while (Date.now() - start < 90000) {
       await bot.waitForTicks(10);
       try {
         out = await furnace.takeOutput();
         if (out) break;
       } catch {}
     }
-    return { ok: true, output: out?.name, deviceUsed: device };
+    const timedOut = !out;
+    return { ok: !!out, output: out?.name, deviceUsed: device, timedOut };
   } finally {
     try { furnace.close(); } catch {}
   }
@@ -622,8 +654,8 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
   if (!block) throw new Error('Campfire vanished');
   await bot.activateBlock(block as any);
   const start = Date.now();
-  // ~35s cook time on campfire
-  while (Date.now() - start < 35000) await bot.waitForTicks(10);
+  const maxMs = 45000; // extend campfire wait to 45s for reliability
+  while (Date.now() - start < maxMs) await bot.waitForTicks(10);
   // Try to pick up cooked item
   const endWait = Date.now() + 5000;
   while (Date.now() < endWait) {
@@ -635,7 +667,8 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
     }
     await bot.waitForTicks(5);
   }
-  return { ok: true, deviceUsed: 'campfire' };
+  const timedOut = Date.now() - start >= maxMs;
+  return { ok: !timedOut, deviceUsed: 'campfire', timedOut };
 }
 
 async function smeltItem(params: Record<string, unknown>) {
@@ -679,9 +712,10 @@ async function retrieveItemsFromNearbyFurnace(params: Record<string, unknown>) {
   const furnacePos = bot.findBlock({ matching: (b: any) => b?.name === 'furnace' || b?.name === 'smoker' || b?.name === 'blast_furnace', maxDistance: 16 });
   if (!furnacePos) throw new Error('No furnace nearby');
   const furnace = await bot.openFurnace(furnacePos as any);
-  const out = await furnace.takeOutput();
+  let out: any = null;
+  try { out = await furnace.takeOutput(); } catch {}
   furnace.close();
-  return { ok: true, output: out?.name };
+  return { ok: !!out, output: out?.name };
 }
 
 async function placeItemNearYou(params: Record<string, unknown>) {
@@ -784,7 +818,8 @@ async function depositItemsToNearbyChest(params: Record<string, unknown>) {
     const item = bot.inventory.items().find(i => i.name === itemName);
     if (!item) throw new Error('Item not in inventory');
     await chest.deposit(item.type, null, count ?? item.count);
-    return { ok: true };
+    const items = chest.containerItems().map((i: any) => ({ name: i.name, count: i.count }));
+    return { ok: true, chestItems: items };
   } finally {
     chest.close();
   }
@@ -803,7 +838,8 @@ async function withdrawItemsFromNearbyChest(params: Record<string, unknown>) {
     const item = mcData.itemsByName[itemName];
     if (!item) throw new Error(`Unknown item ${itemName}`);
     await chest.withdraw(item.id, null, count ?? 1);
-    return { ok: true };
+    const items = chest.containerItems().map((i: any) => ({ name: i.name, count: i.count }));
+    return { ok: true, chestItems: items };
   } finally {
     chest.close();
   }
@@ -919,7 +955,7 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
   if (!seed) throw new Error('Seeds not in inventory');
   await bot.equip(seed, 'hand');
   const origin = bot.entity.position.floored();
-  let planted = 0;
+  let planted = 0; const failed: Array<{x:number,y:number,z:number}> = [];
   for (let dx = -radius; dx <= radius; dx++) {
     for (let dz = -radius; dz <= radius; dz++) {
       const x = origin.x + dx, z = origin.z + dz;
@@ -933,10 +969,12 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
         await bot.activateBlock(farmland as any);
         planted++;
         await bot.waitForTicks(1);
-      } catch {}
+      } catch {
+        failed.push({ x: pos.x, y: pos.y, z: pos.z });
+      }
     }
   }
-  return { ok: true, planted };
+  return { ok: planted > 0, planted, failed };
 }
 
 async function stopAttack(params: Record<string, unknown>) {
@@ -1005,7 +1043,7 @@ async function attackSomeone(params: Record<string, unknown>) {
   } catch {}
   // @ts-ignore
   bot.pvp.attack(entity);
-  const maxMs = Number((params as any).maxMs ?? (params as any).duration ?? 30000);
+  const maxMs = Number((params as any).maxMs ?? (params as any).duration ?? 60000);
   const start = Date.now();
   let result = 'timeout';
   while (Date.now() - start < maxMs) {
@@ -1015,7 +1053,8 @@ async function attackSomeone(params: Record<string, unknown>) {
   }
   // @ts-ignore
   bot.pvp.stop();
-  return { ok: true, result };
+  const timedOut = result === 'timeout';
+  return { ok: !timedOut, result, timedOut };
 }
 
 async function openInventory(params: Record<string, unknown>) {
