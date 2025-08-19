@@ -33,6 +33,14 @@ const log = (...args: unknown[]) => {
 type BotRegistry = Map<string, Bot>;
 const bots: BotRegistry = new Map();
 
+// Prevent process crashes on unexpected async errors
+process.on('unhandledRejection', (err: any) => {
+  try { log('unhandledRejection', err); } catch {}
+});
+process.on('uncaughtException', (err: any) => {
+  try { log('uncaughtException', err); } catch {}
+});
+
 function getBotOrThrow(username?: string): Bot {
   if (username && bots.has(username)) return bots.get(username)!;
   if (username && !bots.has(username)) throw new Error(`Bot '${username}' not found`);
@@ -1330,7 +1338,9 @@ async function main() {
   };
 
   server.onerror = (e) => log("protocol error", e);
-  server.onclose = () => log("protocol closed");
+  server.onclose = () => {
+    log("protocol closed");
+  };
 
 
   // Fallback request handler to ensure clients that call plain strings still get a response
@@ -1355,6 +1365,10 @@ async function main() {
   } catch (e) {
     log("sendToolListChanged post-connect error", e as any);
   }
+  // Keepalive: periodically re-announce tools to keep some clients from idling out
+  setInterval(() => {
+    server.sendToolListChanged().catch(() => {});
+  }, 120000);
 }
 
 main().catch((err) => {
