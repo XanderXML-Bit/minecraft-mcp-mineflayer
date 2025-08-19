@@ -960,11 +960,44 @@ async function smeltItem(params: Record<string, unknown>) {
   const itemName = String(params.itemName || 'iron_ore');
   const preferDevice = params.preferDevice ? String(params.preferDevice) : undefined;
   const fuelName = params.fuelName ? String(params.fuelName) : undefined;
-  const device = chooseDeviceForItem(itemName, preferDevice);
-  if (device === 'campfire') {
-    return cookOnCampfire(bot, itemName);
+  const isFoodItem = isLikelyFood(itemName);
+  const isOreItem = isLikelyOre(itemName);
+  const sequence: Array<'furnace'|'smoker'|'blast_furnace'|'campfire'> = [];
+  if (preferDevice) {
+    const p = preferDevice as any;
+    if (p === 'campfire') sequence.push('campfire');
+    else if (p === 'smoker') sequence.push('smoker');
+    else if (p === 'blast_furnace') sequence.push('blast_furnace');
+    else sequence.push('furnace');
+    if (!sequence.includes('furnace')) sequence.push('furnace');
+    if (isFoodItem && !sequence.includes('campfire')) sequence.push('campfire');
+  } else if (isFoodItem) {
+    sequence.push('smoker', 'furnace', 'campfire');
+  } else if (isOreItem) {
+    sequence.push('blast_furnace', 'furnace');
+  } else {
+    sequence.push('furnace');
   }
-  return cookOrSmeltOnDevice(bot, device as any, itemName, fuelName);
+  const attempts: string[] = [];
+  const errors: string[] = [];
+  for (const dev of sequence) {
+    attempts.push(dev);
+    try {
+      if (dev === 'campfire') {
+        const r = await cookOnCampfire(bot, itemName);
+        if (r?.ok) return { ...r, attemptedDevices: attempts };
+        errors.push('campfire_failed');
+        continue;
+      }
+      const r = await cookOrSmeltOnDevice(bot, dev, itemName, fuelName);
+      if (r?.ok) return { ...r, attemptedDevices: attempts };
+      errors.push(`${dev}_failed${r?.timedOut ? ':timedOut' : ''}`);
+    } catch (e: any) {
+      errors.push(`${dev}: ${String(e?.message || e)}`);
+      continue;
+    }
+  }
+  return { ok: false, error: 'no_device_available', attemptedDevices: attempts, errors };
 }
 
 async function cookItem(params: Record<string, unknown>) {
