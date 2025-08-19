@@ -68,6 +68,19 @@ async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, max
   return block as any;
 }
 
+// CollectBlock with timeout and safe cancellation
+async function collectBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) {
+  let finished = false;
+  const task = (bot as any).collectBlock.collect(block).then(() => { finished = true; });
+  await Promise.race([
+    task,
+    new Promise((_, rej) => setTimeout(() => rej(new Error('collect_timeout')), timeoutMs))
+  ]).catch(async (e) => {
+    try { (bot as any).collectBlock?.cancelTask?.(); } catch {}
+    throw e;
+  });
+}
+
 function getStatus(bot: Bot) {
   const last = (bot as any).__lastDamage || null;
   const lastBroken = (bot as any).__lastBroken || null;
@@ -476,20 +489,28 @@ async function mineResource(params: Record<string, unknown>) {
   const positions = bot.findBlocks({ matching: (b: any) => b && candidates.includes(b.name), maxDistance: 64, count });
   if (!positions.length) throw new Error(`No ${blockName} nearby`);
   const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
-  let completed = 0;
+  let completed = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
   const start = Date.now();
   for (const b of blocks) {
     if (Date.now() - start > maxMs) break;
     try {
-      // @ts-ignore
-      await bot.collectBlock.collect(b);
+      // Navigate near the block first to reduce path issues
+      const p: any = (b as any).position || b;
+      const movements = new Movements(bot);
+      bot.pathfinder.setMovements(movements);
+      bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
+      const navStart = Date.now();
+      while (Date.now() - navStart < 20000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
+      // @ts-ignore perform collect with timeout
+      await collectBlockWithTimeout(bot, b, 30000);
       completed++;
-    } catch (e) {
-      // continue to next block, record failure context
+    } catch (e: any) {
+      const q: any = (b as any).position || b;
+      failed.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
     }
   }
   const timedOut = Date.now() - start > maxMs;
-  return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), timedOut };
+  return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, timedOut };
 }
 
 async function harvestMatureCrops(params: Record<string, unknown>) {
