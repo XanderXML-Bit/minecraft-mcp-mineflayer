@@ -43,14 +43,15 @@ function getBotOrThrow(username?: string): Bot {
 
 // Helpers
 async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, maxDistance = 32, range = 1) {
-  const pos = bot.findBlock({ matching: (b: any) => !!b && predicate(b), maxDistance });
-  if (!pos) throw new Error('Target not found nearby');
+  const block = bot.findBlock({ matching: (b: any) => !!b && predicate(b), maxDistance });
+  if (!block) throw new Error('Target not found nearby');
+  const p: any = (block as any).position || block;
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
-  bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, range));
+  bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, range));
   // give it a moment to walk
   await bot.waitForTicks(20);
-  return pos;
+  return block as any;
 }
 
 function getStatus(bot: Bot) {
@@ -59,7 +60,7 @@ function getStatus(bot: Bot) {
   const isDrowning = bot.oxygenLevel !== undefined && bot.oxygenLevel < 10;
   const effects = Object.values((bot as any).__effects || {}).map((e: any) => ({ id: e.id, amplifier: e.amplifier, duration: e.duration }));
   const env = {
-    isInWater: !!bot.isInWater,
+    isInWater: !!(bot as any).isInWater,
     isOnGround: !!(bot.entity?.onGround),
     oxygenLevel: bot.oxygenLevel,
     isDrowning
@@ -525,7 +526,7 @@ async function craftItems(params: Record<string, unknown>) {
   if (!item) throw new Error(`Unknown item ${itemName}`);
   const recipes = bot.recipesFor(item.id, null, 1, null);
   if (!recipes || recipes.length === 0) throw new Error('No recipe');
-  let tablePos = bot.findBlock({ matching: (b: any) => b?.name === 'crafting_table', maxDistance: 16 });
+  let tablePos: any = bot.findBlock({ matching: (b: any) => b?.name === 'crafting_table', maxDistance: 16 });
   if (!tablePos && recipes[0].requiresTable) {
     // Try to place a crafting table from inventory near the bot
     const tableItem = bot.inventory.items().find(i => i.name === 'crafting_table');
@@ -534,11 +535,11 @@ async function craftItems(params: Record<string, unknown>) {
       if (ref) {
         await bot.equip(tableItem, 'hand');
         await bot.placeBlock(ref as any, new Vec3(0, 1, 0));
-        tablePos = bot.entity.position.floored().offset(0, 0, 1);
+        tablePos = { position: bot.entity.position.floored().offset(0, 0, 1) } as any;
       }
     }
   }
-  await bot.craft(recipes[0], count, (tablePos as any) || null);
+  await bot.craft(recipes[0], count, ((tablePos as any)?.position || tablePos || null) as any);
   return { ok: true };
 }
 
@@ -614,7 +615,8 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
   await bot.equip(food, 'hand');
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
-  bot.pathfinder.setGoal(new goals.GoalNear(campfirePos.x, campfirePos.y, campfirePos.z, 1));
+  const cp: any = (campfirePos as any).position || campfirePos;
+  bot.pathfinder.setGoal(new goals.GoalNear(cp.x, cp.y, cp.z, 1));
   await bot.waitForTicks(10);
   const block = bot.blockAt(campfirePos as any);
   if (!block) throw new Error('Campfire vanished');
@@ -1086,6 +1088,7 @@ async function eatFood(params: Record<string, unknown>) {
   return { ok: true };
 }
 
+async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   let action: any = null;
   try {
     const name = (req as any).params.name as string;
@@ -1150,7 +1153,7 @@ async function eatFood(params: Record<string, unknown>) {
       case "stopAttack": action = await stopAttack(args); break;
       case "stopAllTasks": action = await stopAllTasks(args); break;
       case "selfDefense": action = await selfDefense(args); break;
- 
+
       default:
         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Unknown tool" }) }] };
     }
@@ -1264,6 +1267,13 @@ async function main() {
   log("connecting via stdio...");
   await server.connect(transport);
   log("connected");
+  // Proactively announce tools once connected (some clients rely on this)
+  try {
+    log("sending tool list changed notification");
+    await server.sendToolListChanged();
+  } catch (e) {
+    log("sendToolListChanged post-connect error", e as any);
+  }
 }
 
 main().catch((err) => {
