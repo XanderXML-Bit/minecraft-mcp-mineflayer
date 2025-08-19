@@ -22,6 +22,9 @@
     "url": "https://github.com/XanderXML-Bit/minecraft-mcp-mineflayer/issues"
   },
   "homepage": "https://github.com/XanderXML-Bit/minecraft-mcp-mineflayer#readme",
+  "bin": {
+    "minecraft-mcp-mineflayer": "bin/cli.js"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.3",
     "minecraft-data": "^3.97.0",
