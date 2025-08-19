@@ -59,13 +59,66 @@ async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, max
   bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, range));
   // wait until close enough or timeout
   const start = Date.now();
+  const idleMs = 15000;
+  let lastProgressAt = start;
+  let best = Infinity;
   while (Date.now() - start < timeoutMs) {
     const dist = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z));
     if (dist <= Math.max(1, range) + 0.5) break;
+    if (dist + 0.25 < best) { best = dist; lastProgressAt = Date.now(); }
+    if (Date.now() - lastProgressAt > idleMs) throw new Error('navigation_stalled');
     await bot.waitForTicks(5);
   }
   if (Date.now() - start >= timeoutMs) throw new Error('navigation_timeout');
   return block as any;
+}
+
+// Combat/tool helpers
+function hasArrows(bot: Bot): boolean {
+  return bot.inventory.items().some(i => i.name.includes('arrow'));
+}
+
+async function equipBowIfAvailable(bot: Bot): Promise<boolean> {
+  const bow = bot.inventory.items().find(i => i.name === 'bow');
+  if (bow && hasArrows(bot)) { await bot.equip(bow, 'hand'); return true; }
+  return false;
+}
+
+async function equipBestMeleeWeapon(bot: Bot): Promise<boolean> {
+  const preference = [
+    'netherite_sword','diamond_sword','iron_sword','stone_sword','golden_sword','wooden_sword',
+    'netherite_axe','diamond_axe','iron_axe','stone_axe','golden_axe','wooden_axe'
+  ];
+  for (const name of preference) {
+    const it = bot.inventory.items().find(i => i.name === name);
+    if (it) { await bot.equip(it, 'hand'); return true; }
+  }
+  return false;
+}
+
+async function equipBestToolForBlock(bot: Bot, block: any): Promise<boolean> {
+  try { if ((bot as any).tool?.equipForBlock) { await (bot as any).tool.equipForBlock(block); return true; } } catch {}
+  // Heuristic fallback by block name
+  try {
+    const n = String(block?.name || '').toLowerCase();
+    const pick = ['netherite_pickaxe','diamond_pickaxe','iron_pickaxe','stone_pickaxe','golden_pickaxe','wooden_pickaxe'];
+    const axe = ['netherite_axe','diamond_axe','iron_axe','stone_axe','golden_axe','wooden_axe'];
+    const shovel = ['netherite_shovel','diamond_shovel','iron_shovel','stone_shovel','golden_shovel','wooden_shovel'];
+    const hoe = ['netherite_hoe','diamond_hoe','iron_hoe','stone_hoe','golden_hoe','wooden_hoe'];
+    const pickTargets = ['ore','stone','deepslate','cobblestone','obsidian','netherrack','end_stone','andesite','granite','diorite'];
+    const axeTargets = ['log','planks','wood','stem','hyphae'];
+    const shovelTargets = ['dirt','sand','gravel','snow','clay','soul_sand','soul_soil'];
+    const hoeTargets = ['leaves','hay','wheat','carrots','potatoes','beetroots'];
+    const equipFromList = async (names: string[]) => {
+      for (const nm of names) { const it = bot.inventory.items().find(i => i.name === nm); if (it) { await bot.equip(it, 'hand'); return true; } }
+      return false;
+    };
+    if (pickTargets.some(t => n.includes(t))) return await equipFromList(pick);
+    if (axeTargets.some(t => n.includes(t))) return await equipFromList(axe);
+    if (shovelTargets.some(t => n.includes(t))) return await equipFromList(shovel);
+    if (hoeTargets.some(t => n.includes(t))) return await equipFromList(hoe);
+  } catch {}
+  return false;
 }
 
 // CollectBlock with timeout and safe cancellation
@@ -211,7 +264,13 @@ async function joinGame(params: Record<string, unknown>) {
       const sd = (bot as any).__selfDefense;
       if (sd?.enabled && attacker) {
         try {
-          // Retaliate briefly without permanently hijacking state
+          // Retaliate briefly without permanently hijacking state (equip best)
+          (async () => {
+            const dist = bot.entity.position.distanceTo(attacker.position || bot.entity.position);
+            if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
+              await equipBestMeleeWeapon(bot);
+            }
+          })().catch(() => {});
           // @ts-ignore
           bot.pvp.attack(attacker);
           setTimeout(() => { try { (bot as any).pvp?.stop?.(); } catch {} }, 3000);
@@ -303,12 +362,27 @@ async function goToKnownLocation(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   const x = Number(params.x), y = Number(params.y), z = Number(params.z);
   const range = params.range ? Number(params.range) : 1;
+  const maxMs = Number((params as any).maxMs ?? 60000);
   const mcDataMod = await import("minecraft-data");
   const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
-  return { ok: true };
+  const target = new Vec3(x, y, z);
+  const start = Date.now();
+  let arrived = false;
+  let lastProgressAt = start;
+  let best = Infinity;
+  while (Date.now() - start < maxMs) {
+    const d = bot.entity.position.distanceTo(target);
+    if (d <= Math.max(1, range) + 0.5) { arrived = true; break; }
+    if (d + 0.25 < best) { best = d; lastProgressAt = Date.now(); }
+    if (Date.now() - lastProgressAt > 15000) break; // stalled
+    await bot.waitForTicks(5);
+  }
+  try { bot.pathfinder.stop(); } catch {}
+  const dist = bot.entity.position.distanceTo(target);
+  return { ok: arrived, arrived, distance: dist, timedOut: !arrived };
 }
 
 async function goToSomeone(params: Record<string, unknown>) {
@@ -472,6 +546,12 @@ async function hunt(params: Record<string, unknown>) {
   const name = String(params.targetName || params.targetType || 'cow');
   const ent = bot.nearestEntity((e: any) => (e.name === name || e.displayName === name || e.kind === name));
   if (!ent) throw new Error('No target found');
+  try {
+    const dist = bot.entity.position.distanceTo(ent.position);
+    if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
+      await equipBestMeleeWeapon(bot);
+    }
+  } catch {}
   // @ts-ignore
   bot.pvp.attack(ent);
   const seconds = Number(params.duration ?? 20);
@@ -494,11 +574,13 @@ async function mineResource(params: Record<string, unknown>) {
   const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
   let completed = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
   const start = Date.now();
+  let lastProgressAt = start;
   for (const b of blocks) {
     if (Date.now() - start > maxMs) break;
     try {
       // Navigate near the block first to reduce path issues
       const p: any = (b as any).position || b;
+      await equipBestToolForBlock(bot, b);
       const movements = new Movements(bot);
       bot.pathfinder.setMovements(movements);
       bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
@@ -507,10 +589,12 @@ async function mineResource(params: Record<string, unknown>) {
       // @ts-ignore perform collect with timeout
       await collectBlockWithTimeout(bot, b, 30000);
       completed++;
+      lastProgressAt = Date.now();
     } catch (e: any) {
       const q: any = (b as any).position || b;
       failed.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
     }
+    if (Date.now() - lastProgressAt > 20000) break; // stall protection
   }
   const timedOut = Date.now() - start > maxMs;
   return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, timedOut };
@@ -727,6 +811,8 @@ async function craftItems(params: Record<string, unknown>) {
   const countBefore = invCountByName(item.name);
   let crafted = 0;
 
+  let lastProgressAt = Date.now();
+  const idleMs = 12000;
   while (crafted < count && Date.now() < deadline) {
     try {
       await craftWithTimeout(1, 8000);
@@ -739,6 +825,7 @@ async function craftItems(params: Record<string, unknown>) {
         break;
       }
       crafted += delta;
+      lastProgressAt = Date.now();
     } catch (e: any) {
       const msg = String(e?.message || e);
       errors.push(msg);
@@ -749,6 +836,7 @@ async function craftItems(params: Record<string, unknown>) {
       }
       break;
     }
+    if (Date.now() - lastProgressAt > idleMs) { reason = reason || 'craft_stalled'; break; }
   }
   const timedOut = Date.now() >= deadline && crafted < count;
   // Always compute missing for visibility if we didn't craft everything
@@ -920,6 +1008,7 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
     const outputsTarget = inserted;
     let outputs = 0;
     const deadline = Date.now() + (totalMaxMs ?? Math.max(90000, 60000 * outputsTarget));
+    let lastProgressAt = Date.now();
     let lastOutName: string | undefined;
     while (outputs < outputsTarget && Date.now() < deadline) {
       await bot.waitForTicks(10);
@@ -928,8 +1017,10 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
         if (out) {
           outputs += out.count ?? 1;
           lastOutName = out.name;
+          lastProgressAt = Date.now();
         }
       } catch {}
+      if (Date.now() - lastProgressAt > 15000) break; // stalled smelting
     }
     const timedOut = outputs < outputsTarget;
     return { ok: outputs > 0 && !timedOut, deviceUsed: device, outputsCollected: outputs, requested: count, remaining: Math.max(0, count - outputs), timedOut, output: lastOutName };
@@ -1398,23 +1489,20 @@ async function attackSomeone(params: Record<string, unknown>) {
     entity = Object.values(bot.entities).find((e: any) => type === "player" ? e.type === "player" : e.kind === type);
   }
   if (!entity) throw new Error("Target not found");
-  // Try ranged bow when far enough
+  // Equip best weapon: bow at range if possible, else best melee
   try {
     const rangedMin = 8; // fixed threshold for ranged attacks
-    const bow = bot.inventory.items().find(i => i.name === 'bow');
-    const hasArrow = !!bot.inventory.items().find(i => i.name.includes('arrow'));
-    if (bow && hasArrow) {
-      const dist = bot.entity.position.distanceTo(entity.position);
-      if (dist > rangedMin) {
-        await bot.equip(bow, 'hand');
-        const aim = entity.position.offset(0, (entity as any).height ? (entity as any).height * 0.8 : 1.5, 0);
-        await bot.lookAt(aim, true);
-        // @ts-ignore
-        bot.activateItem();
-        await bot.waitForTicks(15);
-        // @ts-ignore
-        bot.deactivateItem();
-      }
+    const dist = bot.entity.position.distanceTo(entity.position);
+    if (!(await equipBowIfAvailable(bot)) || dist <= rangedMin) {
+      await equipBestMeleeWeapon(bot);
+    } else if (dist > rangedMin) {
+      const aim = entity.position.offset(0, (entity as any).height ? (entity as any).height * 0.8 : 1.5, 0);
+      await bot.lookAt(aim, true);
+      // @ts-ignore
+      bot.activateItem();
+      await bot.waitForTicks(15);
+      // @ts-ignore
+      bot.deactivateItem();
     }
   } catch {}
   // @ts-ignore
