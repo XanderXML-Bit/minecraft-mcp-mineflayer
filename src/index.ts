@@ -84,6 +84,7 @@ async function collectBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) 
 function getStatus(bot: Bot) {
   const last = (bot as any).__lastDamage || null;
   const lastBroken = (bot as any).__lastBroken || null;
+  const lastDefense = (bot as any).__lastDefense || null;
   const isDrowning = bot.oxygenLevel !== undefined && bot.oxygenLevel < 10;
   const effects = Object.values((bot as any).__effects || {}).map((e: any) => ({ id: e.id, amplifier: e.amplifier, duration: e.duration }));
   const env = {
@@ -96,7 +97,9 @@ function getStatus(bot: Bot) {
   (bot as any).__lastBroken = null;
   // Clear lastDamage after reporting (one-shot)
   (bot as any).__lastDamage = null;
-  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, effects, env };
+  // Clear lastDefense after reporting (one-shot)
+  (bot as any).__lastDefense = null;
+  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, effects, env };
 }
 
 function resolveBlockAliases(name: string, mcData: any): string[] {
@@ -181,7 +184,7 @@ async function joinGame(params: Record<string, unknown>) {
   ;(bot as any).__lastHealth = bot.health;
   ;(bot as any).__lastFood = bot.food;
   ;(bot as any).__lastDamage = null;
-  ;(bot as any).__selfDefense = { enabled: false };
+  ;(bot as any).__selfDefense = { enabled: true };
   ;(bot as any).__autoShield = { enabled: true, durationMs: 800 };
   bot.on('health', () => {
     ;(bot as any).__lastHealth = bot.health;
@@ -207,8 +210,13 @@ async function joinGame(params: Record<string, unknown>) {
       };
       const sd = (bot as any).__selfDefense;
       if (sd?.enabled && attacker) {
-        // @ts-ignore
-        bot.pvp.attack(attacker);
+        try {
+          // Retaliate briefly without permanently hijacking state
+          // @ts-ignore
+          bot.pvp.attack(attacker);
+          setTimeout(() => { try { (bot as any).pvp?.stop?.(); } catch {} }, 3000);
+          (bot as any).__lastDefense = { target: attacker?.name || attacker?.username || 'unknown', time: Date.now() };
+        } catch {}
       }
       // Auto shield block
       const as = (bot as any).__autoShield;
@@ -391,12 +399,7 @@ async function stopAllTasks(params: Record<string, unknown>) {
   return { ok: true };
 }
 
-async function selfDefense(params: Record<string, unknown>) {
-  const bot = getBotOrThrow(String(params.username || ""));
-  const enable = Boolean(params.enable ?? true);
-  (bot as any).__selfDefense = { enabled: enable };
-  return { ok: true, enabled: enable };
-}
+// selfDefense tool removed; self-defense is always enabled by default and reported via status.lastDefense one-shot
 
 async function autoShield(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
@@ -1516,7 +1519,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "plantSeedsWithinRadius": action = await plantSeedsWithinRadius(args); break;
       case "stopAttack": action = await stopAttack(args); break;
       case "stopAllTasks": action = await stopAllTasks(args); break;
-      case "selfDefense": action = await selfDefense(args); break;
+      // selfDefense removed
 
       default:
         return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Unknown tool" }) }] };
