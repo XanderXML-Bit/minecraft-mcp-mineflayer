@@ -891,33 +891,48 @@ async function openFurnaceLike(bot: Bot, device: 'furnace'|'smoker'|'blast_furna
   return f;
 }
 
-async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_furnace', itemName: string, fuelName?: string) {
+async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_furnace', itemName: string, fuelName?: string, count: number = 1, totalMaxMs?: number) {
   const furnace: any = await openFurnaceLike(bot, device);
   try {
     try { await furnace.takeOutput(); } catch {}
-    const inputItem = bot.inventory.items().find(i => i.name === itemName);
-    if (!inputItem) throw new Error(`Missing input '${itemName}'`);
-    if (!furnace.inputItem()) {
-      await furnace.putInput(inputItem.type, null, 1);
-    }
+    // Determine how many we can process based on inventory
+    const invItems = bot.inventory.items().filter(i => i.name === itemName);
+    const available = invItems.reduce((a, b) => a + b.count, 0);
+    let toProcess = Math.max(1, Math.min(count, available));
+    if (toProcess <= 0) throw new Error(`Missing input '${itemName}'`);
+    // Ensure fuel present
     if (!furnace.fuelItem()) {
       const fuel = fuelName ? bot.inventory.items().find(i => i.name === fuelName)
         : bot.inventory.items().find(i => ['coal','charcoal','coal_block','lava_bucket','stick','oak_planks','spruce_planks','birch_planks','jungle_planks','acacia_planks','dark_oak_planks','mangrove_planks','cherry_planks','bamboo_planks','crimson_planks','warped_planks'].includes(i.name));
       if (!fuel) throw new Error('Missing fuel');
-      await furnace.putFuel(fuel.type, null, 1);
+      await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count));
     }
-    // Wait up to 90s for an output
-    const start = Date.now();
-    let out: any = null;
-    while (Date.now() - start < 90000) {
+    // Insert inputs in batches
+    let inserted = 0;
+    while (inserted < toProcess) {
+      const nxt = bot.inventory.items().find(i => i.name === itemName && i.count > 0);
+      if (!nxt) break;
+      const batch = Math.min(nxt.count, toProcess - inserted);
+      await furnace.putInput(nxt.type, null, batch);
+      inserted += batch;
+    }
+    // Collect outputs until done or timeout
+    const outputsTarget = inserted;
+    let outputs = 0;
+    const deadline = Date.now() + (totalMaxMs ?? Math.max(90000, 60000 * outputsTarget));
+    let lastOutName: string | undefined;
+    while (outputs < outputsTarget && Date.now() < deadline) {
       await bot.waitForTicks(10);
       try {
-        out = await furnace.takeOutput();
-        if (out) break;
+        const out = await furnace.takeOutput();
+        if (out) {
+          outputs += out.count ?? 1;
+          lastOutName = out.name;
+        }
       } catch {}
     }
-    const timedOut = !out;
-    return { ok: !!out, output: out?.name, deviceUsed: device, timedOut };
+    const timedOut = outputs < outputsTarget;
+    return { ok: outputs > 0 && !timedOut, deviceUsed: device, outputsCollected: outputs, requested: count, remaining: Math.max(0, count - outputs), timedOut, output: lastOutName };
   } finally {
     try { furnace.close(); } catch {}
   }
@@ -936,9 +951,10 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
   await bot.waitForTicks(10);
   const block = bot.blockAt(campfirePos as any);
   if (!block) throw new Error('Campfire vanished');
+  // Place items and wait
   await bot.activateBlock(block as any);
   const start = Date.now();
-  const maxMs = 45000; // extend campfire wait to 45s for reliability
+  const maxMs = 45000;
   while (Date.now() - start < maxMs) await bot.waitForTicks(10);
   // Try to pick up cooked item
   const endWait = Date.now() + 5000;
@@ -960,6 +976,7 @@ async function smeltItem(params: Record<string, unknown>) {
   const itemName = String(params.itemName || 'iron_ore');
   const preferDevice = params.preferDevice ? String(params.preferDevice) : undefined;
   const fuelName = params.fuelName ? String(params.fuelName) : undefined;
+  const count = Number((params as any).count ?? 1);
   const isFoodItem = isLikelyFood(itemName);
   const isOreItem = isLikelyOre(itemName);
   const sequence: Array<'furnace'|'smoker'|'blast_furnace'|'campfire'> = [];
@@ -989,7 +1006,7 @@ async function smeltItem(params: Record<string, unknown>) {
         errors.push('campfire_failed');
         continue;
       }
-      const r = await cookOrSmeltOnDevice(bot, dev, itemName, fuelName);
+      const r = await cookOrSmeltOnDevice(bot, dev, itemName, fuelName, count);
       if (r?.ok) return { ...r, attemptedDevices: attempts };
       errors.push(`${dev}_failed${r?.timedOut ? ':timedOut' : ''}`);
     } catch (e: any) {
@@ -1605,8 +1622,8 @@ function listTools() {
     ,{ name: "craftItems", description: "Craft items using a crafting table", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, count: { type: "number" } }, required: ["itemName"] } }
     ,{ name: "listRecipes", description: "List recipes for an item and how many are craftable with current inventory", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "listAllRecipes", description: "List many recipes across items; filter by search, requiresTable, craftableOnly, limit", inputSchema: { type: "object", properties: { username: { type: "string" }, search: { type: "string" }, requiresTable: { type: "boolean" }, craftableOnly: { type: "boolean" }, limit: { type: "number" } } } }
-    ,{ name: "cookItem", description: "Cook items in a furnace", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }
-    ,{ name: "smeltItem", description: "Smelt items in a furnace", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }
+    ,{ name: "cookItem", description: "Cook items (furnace/smoker/campfire; campfire ignores count)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" }, count: { type: "number" }, preferDevice: { type: "string", enum: ["furnace","smoker","blast_furnace","campfire"] } }, required: ["itemName"] } }
+    ,{ name: "smeltItem", description: "Smelt items (blast_furnace/furnace with fallback)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" }, count: { type: "number" }, preferDevice: { type: "string", enum: ["furnace","smoker","blast_furnace","campfire"] } }, required: ["itemName"] } }
     ,{ name: "cookWithSmoker", description: "Cook items in a smoker (optimized for food)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "smeltWithBlastFurnace", description: "Smelt items in a blast furnace (optimized for ores)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, fuelName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "cookWithCampfire", description: "Cook items on a campfire (no fuel, slower)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
