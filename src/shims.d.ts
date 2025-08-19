@@ -15,4 +15,16 @@ declare module "@modelcontextprotocol/sdk/server/stdio" {
   }
 }
 
+declare module "@modelcontextprotocol/sdk/dist/esm/server/stdio.js" {
+  export class StdioServerTransport {
+    constructor(...args: any[])
+    start(): Promise<void>
+    close(): Promise<void>
+    send(message: any, options?: any): Promise<void>
+    onclose?: () => void
+    onerror?: (error: Error) => void
+    onmessage?: (message: any) => void
+  }
+}
+
 

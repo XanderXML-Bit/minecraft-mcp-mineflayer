@@ -1,11 +1,11 @@
 import { Server } from "@modelcontextprotocol/sdk/server";
 import mineflayer, { Bot } from "mineflayer";
-import { pathfinder, Movements, goals } from "mineflayer-pathfinder";
+import pathfinderPkg from "mineflayer-pathfinder";
 import armorManager from "mineflayer-armor-manager";
-import { plugin as pvp } from "mineflayer-pvp";
+import pvpPkg from "mineflayer-pvp";
 import { loader as autoEatPlugin } from "mineflayer-auto-eat";
-import toolPlugin from "mineflayer-tool";
-import collectBlockPlugin from "mineflayer-collectblock";
+import toolPkg from "mineflayer-tool";
+import collectBlockPkg from "mineflayer-collectblock";
 import { Vec3 } from "vec3";
 import {
   StateTransition,
@@ -17,6 +17,19 @@ import {
   NestedStateMachine
 } from "mineflayer-statemachine";
 
+// Handle CJS interop for mineflayer-pathfinder and plugins
+const { pathfinder, Movements, goals } = (pathfinderPkg as any);
+const { plugin: pvp } = (pvpPkg as any);
+const { plugin: toolPlugin } = (toolPkg as any);
+const { plugin: collectBlockPlugin } = (collectBlockPkg as any);
+
+const log = (...args: unknown[]) => {
+  try {
+    // Log to stderr so we don't interfere with MCP stdio protocol on stdout
+    // eslint-disable-next-line no-console
+    console.error("[minecraft-mcp]", ...args);
+  } catch {}
+};
 type BotRegistry = Map<string, Bot>;
 const bots: BotRegistry = new Map();
 
@@ -340,6 +353,7 @@ function listTools() {
 }
 
 async function main() {
+  log("server starting");
   const server = new Server({
     name: "minecraft-mcp-mineflayer",
     version: "0.1.0",
@@ -347,14 +361,31 @@ async function main() {
     capabilities: { tools: {} },
   });
 
-  const sdkTypes = await import("@modelcontextprotocol/sdk/types");
-  const { ListToolsRequestSchema, CallToolRequestSchema } = sdkTypes as any;
-  server.setRequestHandler(ListToolsRequestSchema as any, async () => listTools());
-  server.setRequestHandler(CallToolRequestSchema as any, async (req: any) => sendToolCall(req));
+  // Notify client about tool availability after initialization
+  server.oninitialized = () => {
+    log("initialized; announcing tools list changed");
+    server.sendToolListChanged().catch((e) => log("sendToolListChanged error", e));
+  };
 
-  const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio");
+  server.onerror = (e) => log("protocol error", e);
+  server.onclose = () => log("protocol closed");
+
+
+  // Fallback request handler to ensure clients that call plain strings still get a response
+  server.fallbackRequestHandler = async (request: any) => {
+    const m = request?.method;
+    log("fallback handler", m);
+    if (m === "tools/list" || m === "list_tools") return listTools() as any;
+    if (m === "tools/call" || m === "call_tool") return sendToolCall(request) as any;
+    return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Unknown method" }) }] } as any;
+  };
+
+  // Dynamically import the stdio transport at runtime to avoid ESM path mismatches
+  const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
   const transport = new StdioServerTransport();
+  log("connecting via stdio...");
   await server.connect(transport);
+  log("connected");
 }
 
 main().catch((err) => {
