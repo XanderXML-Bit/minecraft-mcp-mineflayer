@@ -138,6 +138,7 @@ function getStatus(bot: Bot) {
   const last = (bot as any).__lastDamage || null;
   const lastBroken = (bot as any).__lastBroken || null;
   const lastDefense = (bot as any).__lastDefense || null;
+  const lastDeath = (bot as any).__lastDeath || null;
   const isDrowning = bot.oxygenLevel !== undefined && bot.oxygenLevel < 10;
   const effects = Object.values((bot as any).__effects || {}).map((e: any) => ({ id: e.id, amplifier: e.amplifier, duration: e.duration }));
   const env = {
@@ -152,7 +153,9 @@ function getStatus(bot: Bot) {
   (bot as any).__lastDamage = null;
   // Clear lastDefense after reporting (one-shot)
   (bot as any).__lastDefense = null;
-  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, effects, env };
+  // Clear lastDeath after reporting (one-shot)
+  (bot as any).__lastDeath = null;
+  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, lastDeath, effects, env };
 }
 
 function resolveBlockAliases(name: string, mcData: any): string[] {
@@ -284,6 +287,25 @@ async function joinGame(params: Record<string, unknown>) {
       }
     }
   });
+
+  // Track death info (position, cause)
+  try {
+    bot.on('death', () => {
+      const pos = bot.entity?.position?.clone?.() || bot.entity?.position;
+      (bot as any).__lastDeath = {
+        position: pos ? { x: pos.x, y: pos.y, z: pos.z } : undefined,
+        time: Date.now(),
+        cause: (bot as any).lastDeathCause || 'unknown'
+      };
+    });
+    bot.on('message', (jsonMsg: any) => {
+      const text = jsonMsg?.toString?.() ?? String(jsonMsg?.text ?? "");
+      // Heuristic: capture death-related messages as cause
+      if (/slain|fell|doomed|burned|drowned|blew up|pricked|shot/i.test(text)) {
+        (bot as any).lastDeathCause = text;
+      }
+    });
+  } catch {}
 
   bot.once("login", async () => {
     // Configure auto eat
@@ -543,22 +565,69 @@ async function swimToLand(params: Record<string, unknown>) {
 
 async function hunt(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
-  const name = String(params.targetName || params.targetType || 'cow');
-  const ent = bot.nearestEntity((e: any) => (e.name === name || e.displayName === name || e.kind === name));
-  if (!ent) throw new Error('No target found');
-  try {
-    const dist = bot.entity.position.distanceTo(ent.position);
-    if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
-      await equipBestMeleeWeapon(bot);
+  const targetKey = String(params.targetName || params.targetType || 'cow');
+  const countTarget = Math.max(1, Number((params as any).count ?? 1));
+  const maxMs = Number((params as any).maxMs ?? 120000);
+  const stallMs = 20000;
+  let kills = 0; const errors: string[] = [];
+  const start = Date.now();
+  let lastProgressAt = start;
+
+  const matches = (e: any) => (e && (e.name === targetKey || e.displayName === targetKey || e.kind === targetKey));
+
+  while (kills < countTarget && Date.now() - start < maxMs) {
+    // Acquire target
+    let ent: any = bot.nearestEntity(matches);
+    const acquireStart = Date.now();
+    while (!ent && Date.now() - acquireStart < 10000) { await bot.waitForTicks(5); ent = bot.nearestEntity(matches); }
+    if (!ent) { errors.push('no_target_found'); break; }
+
+    try {
+      const dist = bot.entity.position.distanceTo(ent.position);
+      if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
+        await equipBestMeleeWeapon(bot);
+      }
+    } catch {}
+
+    // Attack and wait for outcome
+    const targetId = ent.id;
+    let dead = false;
+    const onDead = (entity: any) => { if (entity?.id === targetId) dead = true; };
+    try { bot.on('entityDead', onDead as any); } catch {}
+    try {
+      // @ts-ignore
+      bot.pvp.attack(ent);
+      const fightStart = Date.now();
+      while (Date.now() - fightStart < 30000) {
+        await bot.waitForTicks(5);
+        if (dead) break;
+        const still = Object.values(bot.entities).find((e: any) => e.id === targetId);
+        if (!still) { // out of range or dead
+          // give a brief grace to get death event
+          const grace = Date.now() + 1000;
+          while (!dead && Date.now() < grace) { await bot.waitForTicks(2); }
+          break;
+        }
+      }
+    } finally {
+      try { (bot as any).pvp?.stop?.(); } catch {}
+      try { bot.removeListener('entityDead', onDead as any); } catch {}
     }
-  } catch {}
-  // @ts-ignore
-  bot.pvp.attack(ent);
-  const seconds = Number(params.duration ?? 20);
-  await new Promise(r => setTimeout(r, seconds * 1000));
-  // @ts-ignore
-  bot.pvp.stop();
-  return { ok: true };
+
+    if (dead) {
+      kills++;
+      lastProgressAt = Date.now();
+      continue;
+    } else {
+      errors.push('target_escaped_or_timeout');
+    }
+
+    if (Date.now() - lastProgressAt > stallMs) break;
+  }
+
+  const timedOut = kills < countTarget && Date.now() - start >= maxMs;
+  const stalled = kills < countTarget && Date.now() - lastProgressAt > stallMs;
+  return { ok: kills > 0, requested: countTarget, kills, remaining: Math.max(0, countTarget - kills), timedOut, stalled, errors };
 }
 
 async function mineResource(params: Record<string, unknown>) {
@@ -1703,7 +1772,7 @@ function listTools() {
     ,{ name: "stopFollow", description: "Stop following", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "runAway", description: "Run away from threats", inputSchema: { type: "object", properties: { username: { type: "string" }, distance: { type: "number" } } } }
     ,{ name: "swimToLand", description: "Swim to nearest land when in water", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
-    ,{ name: "hunt", description: "Hunt animals or mobs", inputSchema: { type: "object", properties: { username: { type: "string" }, targetName: { type: "string" }, duration: { type: "number" } } } }
+    ,{ name: "hunt", description: "Hunt animals or mobs until count reached (kills)", inputSchema: { type: "object", properties: { username: { type: "string" }, targetName: { type: "string" }, targetType: { type: "string" }, count: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "mineResource", description: "Mine specific blocks or resources", inputSchema: { type: "object", properties: { username: { type: "string" }, blockName: { type: "string" }, count: { type: "number" } }, required: ["blockName"] } }
     ,{ name: "harvestMatureCrops", description: "Harvest mature crops from farmland", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" } } } }
     ,{ name: "pickupItem", description: "Pick up items from the ground", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } } } }
