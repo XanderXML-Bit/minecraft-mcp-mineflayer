@@ -563,23 +563,118 @@ async function craftItems(params: Record<string, unknown>) {
   const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
   const item = mcData.itemsByName[itemName];
   if (!item) throw new Error(`Unknown item ${itemName}`);
-  const recipes = bot.recipesFor(item.id, null, 1, null);
-  if (!recipes || recipes.length === 0) throw new Error('No recipe');
-  let tablePos: any = bot.findBlock({ matching: (b: any) => b?.name === 'crafting_table', maxDistance: 16 });
-  if (!tablePos && recipes[0].requiresTable) {
-    // Try to place a crafting table from inventory near the bot
+  // Initial recipe discovery to know if we need a table
+  let initialRecipes = bot.recipesFor(item.id, null, 1, null);
+  if (!initialRecipes || initialRecipes.length === 0) throw new Error('No recipe');
+  const recipeNeedsTable = !!initialRecipes.find(r => (r as any).requiresTable);
+
+  // Find or place a crafting table if needed
+  let tableBlock: any = bot.findBlock({ matching: (b: any) => b?.name === 'crafting_table', maxDistance: 16 }) || null;
+  if (recipeNeedsTable && !tableBlock) {
     const tableItem = bot.inventory.items().find(i => i.name === 'crafting_table');
-    if (tableItem) {
-      const ref = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0));
-      if (ref) {
-        await bot.equip(tableItem, 'hand');
-        await bot.placeBlock(ref as any, new Vec3(0, 1, 0));
-        tablePos = { position: bot.entity.position.floored().offset(0, 0, 1) } as any;
-      }
+    if (!tableItem) throw new Error('crafting_table required but not found nearby or in inventory');
+    const ref = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0));
+    if (!ref) throw new Error('No support block to place crafting_table');
+    await bot.equip(tableItem, 'hand');
+    await bot.placeBlock(ref as any, new Vec3(0, 1, 0));
+    await bot.waitForTicks(2);
+    const pos = bot.entity.position.floored().offset(0, 0, 1);
+    tableBlock = bot.blockAt(pos as any);
+  }
+
+  // If using a table, path within 2 blocks so crafting UI opens reliably
+  if (tableBlock) {
+    const tp: any = (tableBlock as any).position || tableBlock;
+    const movements = new Movements(bot);
+    bot.pathfinder.setMovements(movements);
+    bot.pathfinder.setGoal(new goals.GoalNear(tp.x, tp.y, tp.z, 2));
+    const start = Date.now();
+    while (Date.now() - start < 15000) {
+      const d = bot.entity.position.distanceTo(new Vec3(tp.x, tp.y, tp.z));
+      if (d <= 3) break;
+      await bot.waitForTicks(5);
     }
   }
-  await bot.craft(recipes[0], count, ((tablePos as any)?.position || tablePos || null) as any);
-  return { ok: true };
+
+  // Refresh recipes with correct context
+  let recipes = bot.recipesFor(item.id, null, 1, tableBlock || null);
+  if (!recipes || recipes.length === 0) throw new Error('No recipe (context)');
+  // Prefer a table recipe if we have a table; otherwise the first
+  const recipe = (tableBlock && recipes.find(r => (r as any).requiresTable)) || recipes[0];
+
+  function computeMissingFor(units: number) {
+    try {
+      const invMap: Record<number, number> = {};
+      for (const it of bot.inventory.items()) invMap[it.type] = (invMap[it.type] || 0) + it.count;
+      const reqMap: Record<number, number> = {};
+      const r: any = recipe as any;
+      // Shapeless recipes may provide ingredients
+      if (Array.isArray(r.ingredients)) {
+        for (const ing of r.ingredients) {
+          if (!ing) continue;
+          const id = Number(ing.id);
+          const c = Number((ing.count ?? 1)) * units;
+          reqMap[id] = (reqMap[id] || 0) + c;
+        }
+      }
+      // Shaped recipes may provide inShape
+      if (Array.isArray(r.inShape)) {
+        for (const row of r.inShape) {
+          if (!Array.isArray(row)) continue;
+          for (const cell of row) {
+            if (!cell) continue;
+            const id = Number(cell.id);
+            reqMap[id] = (reqMap[id] || 0) + 1 * units;
+          }
+        }
+      }
+      const missing: Array<{ id: number; name: string; count: number }> = [];
+      for (const idStr of Object.keys(reqMap)) {
+        const id = Number(idStr);
+        const need = reqMap[id];
+        const have = invMap[id] || 0;
+        if (have < need) {
+          const name = (mcData.items[id]?.name) || String(id);
+          missing.push({ id, name, count: need - have });
+        }
+      }
+      return missing;
+    } catch {
+      return [] as Array<{ id: number; name: string; count: number }>;
+    }
+  }
+
+  let crafted = 0; const errors: string[] = [];
+  const deadline = Date.now() + Number((params as any).maxMs ?? 60000);
+  let reason: string | undefined;
+  while (crafted < count && Date.now() < deadline) {
+    const remaining = count - crafted;
+    try {
+      await bot.craft(recipe, remaining, tableBlock || null);
+      crafted += remaining;
+      break;
+    } catch (e: any) {
+      errors.push(String(e?.message || e));
+      const missing = computeMissingFor(remaining);
+      if (missing.length > 0) reason = 'missing_resources';
+      // Try to craft one at a time to salvage progress
+      try {
+        await bot.craft(recipe, 1, tableBlock || null);
+        crafted += 1;
+      } catch (e2: any) {
+        errors.push(String(e2?.message || e2));
+        if (!reason) {
+          const miss1 = computeMissingFor(1);
+          if (miss1.length > 0) reason = 'missing_resources';
+        }
+        break;
+      }
+    }
+    await bot.waitForTicks(1);
+  }
+  const timedOut = Date.now() >= deadline && crafted < count;
+  if (!reason && recipeNeedsTable && !tableBlock) reason = 'missing_table';
+  return { ok: crafted > 0, requested: count, crafted, remaining: Math.max(0, count - crafted), usedTable: !!tableBlock, timedOut, reason, missingItems: reason === 'missing_resources' ? computeMissingFor(count - crafted || 1) : [], errors };
 }
 
 // ---- Cooking/Smelting helpers ----
