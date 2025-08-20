@@ -238,9 +238,9 @@ function resolveBlockAliases(name: string, mcData: any): string[] {
 function isWaterLike(block: any): boolean {
   if (!block) return false;
   const n = String(block.name || '').toLowerCase();
-  const liquid = Boolean((block as any).liquid);
   const waterlogged = Boolean((block as any).getProperties?.()?.waterlogged);
-  return liquid || waterlogged || n === 'water' || n.endsWith('_water');
+  // Treat only true water blocks or waterlogged blocks as valid hydration sources
+  return waterlogged || n === 'water';
 }
 
 function isPlantObstruction(name: string): boolean {
@@ -1451,6 +1451,8 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
   const origin = bot.entity.position.floored();
   await bot.equip(hoe, 'hand');
   let tilled = 0; const attempts: Array<{x:number,y:number,z:number, ok:boolean}> = [];
+  let sawCandidate = false;
+  let sawCandidateWithinWater = false;
   for (let dx = -radius; dx <= radius; dx++) {
     for (let dz = -radius; dz <= radius; dz++) {
       const x = origin.x + dx, z = origin.z + dz;
@@ -1468,6 +1470,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
         }
         const above2 = bot.blockAt(pos.offset(0, 1, 0));
         if (!above2 || above2.boundingBox !== 'empty') continue;
+        sawCandidate = true;
         // Optional water proximity requirement (hydration)
         if (requireWater) {
           let waterFound = false;
@@ -1475,13 +1478,15 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
             for (let rz = -hydrationRadius; rz <= hydrationRadius && !waterFound; rz++) {
               // Chebyshev distance <= 4
               if (Math.max(Math.abs(rx), Math.abs(rz)) > hydrationRadius) continue;
-              for (let ry = -1; ry <= 1 && !waterFound; ry++) {
+              // Only same Y or one above (per vanilla hydration)
+              for (let ry = 0; ry <= 1 && !waterFound; ry++) {
                 const wp = pos.offset(rx, ry, rz);
                 const w = bot.blockAt(wp);
                 if (isWaterLike(w)) waterFound = true;
               }
             }
           }
+          if (waterFound) sawCandidateWithinWater = true;
           if (!waterFound) continue;
         }
         // Move into range
@@ -1501,6 +1506,9 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
         break; // stop vertical scan for this (x,z)
       }
     }
+  }
+  if (requireWater && tilled === 0 && sawCandidate && !sawCandidateWithinWater) {
+    return { ok: false, tilled: 0, reason: 'no_water_nearby', hydrationRadius, attempted: attempts };
   }
   return { ok: tilled > 0, tilled, attempted: attempts };
 }
