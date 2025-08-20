@@ -238,9 +238,8 @@ function resolveBlockAliases(name: string, mcData: any): string[] {
 function isWaterLike(block: any): boolean {
   if (!block) return false;
   const n = String(block.name || '').toLowerCase();
-  const waterlogged = Boolean((block as any).getProperties?.()?.waterlogged);
-  // Treat only true water blocks or waterlogged blocks as valid hydration sources
-  return waterlogged || n === 'water';
+  // Vanilla hydration: only true water blocks hydrate farmland
+  return n === 'water';
 }
 
 function isPlantObstruction(name: string): boolean {
@@ -1478,7 +1477,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
             for (let rz = -hydrationRadius; rz <= hydrationRadius && !waterFound; rz++) {
               // Chebyshev distance <= 4
               if (Math.max(Math.abs(rx), Math.abs(rz)) > hydrationRadius) continue;
-              // Only same Y or one above (per vanilla hydration)
+              // Only same Y or one above (vanilla hydration)
               for (let ry = 0; ry <= 1 && !waterFound; ry++) {
                 const wp = pos.offset(rx, ry, rz);
                 const w = bot.blockAt(wp);
