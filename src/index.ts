@@ -1349,7 +1349,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
   if (!hoe) throw new Error('No hoe in inventory');
   const radius = Number((params as any).radius ?? 3);
   const requireWater = Boolean((params as any).requireWater ?? true);
-  const waterRadius = Math.max(1, Math.min(6, Number((params as any).waterRadius ?? 4)));
+  const hydrationRadius = 4; // Minecraft hydration: up to 4 blocks horizontally (diagonal included)
   const origin = bot.entity.position.floored();
   await bot.equip(hoe, 'hand');
   let tilled = 0; const attempts: Array<{x:number,y:number,z:number, ok:boolean}> = [];
@@ -1373,8 +1373,10 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
         // Optional water proximity requirement (hydration)
         if (requireWater) {
           let waterFound = false;
-          for (let rx = -waterRadius; rx <= waterRadius && !waterFound; rx++) {
-            for (let rz = -waterRadius; rz <= waterRadius && !waterFound; rz++) {
+          for (let rx = -hydrationRadius; rx <= hydrationRadius && !waterFound; rx++) {
+            for (let rz = -hydrationRadius; rz <= hydrationRadius && !waterFound; rz++) {
+              // Chebyshev distance <= 4
+              if (Math.max(Math.abs(rx), Math.abs(rz)) > hydrationRadius) continue;
               for (let ry = -1; ry <= 1 && !waterFound; ry++) {
                 const wp = pos.offset(rx, ry, rz);
                 const w = bot.blockAt(wp);
