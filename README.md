@@ -72,11 +72,6 @@ Toggle the MCP in Cursor’s settings.
   - Fields include: `requested`, `crafted`, `remaining`, `usedTable`, `timedOut`, `reason` (`missing_resources` | `missing_table` | undefined), `missingItems` (when resources are missing), and `errors`.
   - You may set `maxMs` to bound total crafting time; the tool also uses small per-batch timeouts to avoid stalling.
 
-### Notes
-- Bow shots require a bow and arrows; otherwise melee is used. The ranged threshold is 8 blocks (fixed).
-- Shields can be equipped to off‑hand. Raising a shield automatically may vary by version; holding right‑click can be simulated for blocking if needed.
-- Place furnaces/smokers/blast furnaces/campfires within ~16 blocks for reliable detection.
-- Campfire cooking is slower and may drop output to pick up.
 
 ### References
 - Mineflayer: `https://github.com/PrismarineJS/mineflayer`

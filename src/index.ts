@@ -121,17 +121,40 @@ async function equipBestToolForBlock(bot: Bot, block: any): Promise<boolean> {
   return false;
 }
 
-// CollectBlock with timeout and safe cancellation
+// CollectBlock with timeout and safe cancellation (avoid unhandled rejections)
 async function collectBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) {
-  let finished = false;
-  const task = (bot as any).collectBlock.collect(block).then(() => { finished = true; });
-  await Promise.race([
-    task,
-    new Promise((_, rej) => setTimeout(() => rej(new Error('collect_timeout')), timeoutMs))
-  ]).catch(async (e) => {
+  const rawTask: Promise<any> = (bot as any).collectBlock.collect(block);
+  // Attach catch so rejections are handled even if we time out
+  const guardedTask = rawTask.catch((e) => { throw e; });
+  try {
+    await Promise.race([
+      guardedTask,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('collect_timeout')), timeoutMs))
+    ]);
+  } catch (e) {
     try { (bot as any).collectBlock?.cancelTask?.(); } catch {}
+    // Ensure any late rejections are consumed
+    try { rawTask.catch(() => {}); } catch {}
     throw e;
-  });
+  }
+}
+
+// Dig with timeout and safe cancellation
+async function digBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) {
+  let finished = false;
+  const digging = bot.dig(block as any).then(() => { finished = true; });
+  try {
+    await Promise.race([
+      digging,
+      new Promise((_, rej) => setTimeout(() => {
+        try { (bot as any).stopDigging?.(); } catch {}
+        rej(new Error('dig_timeout'));
+      }, timeoutMs))
+    ]);
+  } finally {
+    // Ensure we consume any late rejections
+    try { (digging as any).catch?.(() => {}); } catch {}
+  }
 }
 
 function getStatus(bot: Bot) {
@@ -564,15 +587,6 @@ async function autoShield(params: Record<string, unknown>) {
   const durationMs = Number((params as any).durationMs ?? 800);
   (bot as any).__autoShield = { enabled: enable, durationMs };
   return { ok: true, enabled: enable, durationMs };
-}
-
-// Optional: expose self-defense config tweak
-async function selfDefense(params: Record<string, unknown>) {
-  const bot = getBotOrThrow(String(params.username || ""));
-  const enabled = Boolean((params as any).enabled ?? true);
-  const durationMs = Number((params as any).durationMs ?? 10000);
-  (bot as any).__selfDefense = { enabled, durationMs };
-  return { ok: true, enabled, durationMs };
 }
 
 async function raiseShield(params: Record<string, unknown>) {
@@ -2017,7 +2031,6 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "gatherSeeds": action = await gatherSeeds(args); break;
       case "stopAttack": action = await stopAttack(args); break;
       case "stopAllTasks": action = await stopAllTasks(args); break;
-      case "selfDefense": action = await selfDefense(args); break;
       // selfDefense removed
 
       default:
@@ -2098,7 +2111,6 @@ function listTools() {
     ,{ name: "plantSeedsWithinRadius", description: "Plant seeds on nearby farmland within radius", inputSchema: { type: "object", properties: { username: { type: "string" }, seedName: { type: "string" }, radius: { type: "number" } } } }
     ,{ name: "gatherSeeds", description: "Break grass to collect wheat_seeds until count reached", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" }, radius: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "stopAttack", description: "Stop current attack", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
-    ,{ name: "selfDefense", description: "Configure self-defense window (ms)", inputSchema: { type: "object", properties: { username: { type: "string" }, enabled: { type: "boolean" }, durationMs: { type: "number" } } } }
     
   ];
   return { tools };
