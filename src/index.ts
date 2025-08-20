@@ -300,7 +300,7 @@ async function joinGame(params: Record<string, unknown>) {
   ;(bot as any).__lastHealth = bot.health;
   ;(bot as any).__lastFood = bot.food;
   ;(bot as any).__lastDamage = null;
-  ;(bot as any).__selfDefense = { enabled: true };
+  ;(bot as any).__selfDefense = { enabled: true, durationMs: 10000 };
   ;(bot as any).__autoShield = { enabled: true, durationMs: 800 };
   bot.on('health', () => {
     ;(bot as any).__lastHealth = bot.health;
@@ -336,7 +336,8 @@ async function joinGame(params: Record<string, unknown>) {
           })().catch(() => {});
           // @ts-ignore
           bot.pvp.attack(attacker);
-          setTimeout(() => { try { (bot as any).pvp?.stop?.(); } catch {} }, 3000);
+          const sdMs = Number(((bot as any).__selfDefense?.durationMs) ?? 10000);
+          setTimeout(() => { try { (bot as any).pvp?.stop?.(); } catch {} }, sdMs);
           (bot as any).__lastDefense = { target: attacker?.name || attacker?.username || 'unknown', time: Date.now() };
         } catch {}
       }
@@ -563,6 +564,15 @@ async function autoShield(params: Record<string, unknown>) {
   const durationMs = Number((params as any).durationMs ?? 800);
   (bot as any).__autoShield = { enabled: enable, durationMs };
   return { ok: true, enabled: enable, durationMs };
+}
+
+// Optional: expose self-defense config tweak
+async function selfDefense(params: Record<string, unknown>) {
+  const bot = getBotOrThrow(String(params.username || ""));
+  const enabled = Boolean((params as any).enabled ?? true);
+  const durationMs = Number((params as any).durationMs ?? 10000);
+  (bot as any).__selfDefense = { enabled, durationMs };
+  return { ok: true, enabled, durationMs };
 }
 
 async function raiseShield(params: Record<string, unknown>) {
@@ -2007,6 +2017,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "gatherSeeds": action = await gatherSeeds(args); break;
       case "stopAttack": action = await stopAttack(args); break;
       case "stopAllTasks": action = await stopAllTasks(args); break;
+      case "selfDefense": action = await selfDefense(args); break;
       // selfDefense removed
 
       default:
@@ -2087,6 +2098,7 @@ function listTools() {
     ,{ name: "plantSeedsWithinRadius", description: "Plant seeds on nearby farmland within radius", inputSchema: { type: "object", properties: { username: { type: "string" }, seedName: { type: "string" }, radius: { type: "number" } } } }
     ,{ name: "gatherSeeds", description: "Break grass to collect wheat_seeds until count reached", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" }, radius: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "stopAttack", description: "Stop current attack", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
+    ,{ name: "selfDefense", description: "Configure self-defense window (ms)", inputSchema: { type: "object", properties: { username: { type: "string" }, enabled: { type: "boolean" }, durationMs: { type: "number" } } } }
     
   ];
   return { tools };
