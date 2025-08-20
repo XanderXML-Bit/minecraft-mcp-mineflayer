@@ -477,6 +477,7 @@ async function joinGame(params: Record<string, unknown>) {
           if (!(bot as any).__autoEatCfg?.enabled) return;
           if (!bot.entity) return;
           if (bot.food >= hungerThreshold) return;
+          if ((bot as any).__suspendAutoEat) return;
           const now = Date.now();
           if ((bot as any).__autoEatCfg.isEating) return;
           (bot as any).__autoEatCfg.lastTriedAt = now;
@@ -823,7 +824,13 @@ async function mineResource(params: Record<string, unknown>) {
       const navStart = Date.now();
       while (Date.now() - navStart < 20000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
       // @ts-ignore perform collect with timeout
-      await collectBlockWithTimeout(bot, b, 30000);
+      try {
+        // Temporarily suspend auto-eat to avoid conflicts during collect/dig
+        (bot as any).__suspendAutoEat = true;
+        await collectBlockWithTimeout(bot, b, 30000);
+      } finally {
+        (bot as any).__suspendAutoEat = false;
+      }
       completed++;
       lastProgressAt = Date.now();
     } catch (e: any) {
@@ -833,7 +840,8 @@ async function mineResource(params: Record<string, unknown>) {
     if (Date.now() - lastProgressAt > 20000) break; // stall protection
   }
   const timedOut = Date.now() - start > maxMs;
-  return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, timedOut };
+  const stalled = Date.now() - lastProgressAt > 20000 && !timedOut && completed < count;
+  return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, timedOut, stalled };
 }
 
 async function harvestMatureCrops(params: Record<string, unknown>) {
