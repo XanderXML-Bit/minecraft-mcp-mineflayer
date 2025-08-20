@@ -718,18 +718,23 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   const crops = ['wheat', 'carrots', 'potatoes', 'beetroots'];
   const want = Math.max(1, Number((params as any).count ?? 8));
-  const positions = bot.findBlocks({
-    matching: (b: any) => {
-      if (!b) return false;
-      if (!crops.includes(b.name)) return false;
-      const age = (b as any).getProperties?.().age ?? (b as any).metadata ?? 0;
-      return age >= 7;
-    },
-    maxDistance: 64,
-    count: want
-  });
-  if (!positions.length) throw new Error('No mature crops found');
-  const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
+  // Dynamic scan for candidate crop blocks around bot within radius
+  const radius = 16;
+  const origin = bot.entity.position.floored();
+  const blocks: any[] = [];
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        const p = new Vec3(origin.x + dx, origin.y + dy, origin.z + dz);
+        const b = bot.blockAt(p);
+        if (!b) continue;
+        if (!crops.includes(b.name)) continue;
+        const age = (b as any).getProperties?.().age ?? (b as any).metadata ?? 0;
+        if (age >= 7) blocks.push(b);
+      }
+    }
+  }
+  if (!blocks.length) throw new Error('No mature crops found');
   let harvested = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
   const maxMs = Number((params as any).maxMs ?? 120000);
   const start = Date.now();
@@ -743,7 +748,9 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
       bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
       const navStart = Date.now();
       while (Date.now() - navStart < 20000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
-      await collectBlockWithTimeout(bot, b, 25000);
+      // Prefer direct dig for reliability on crop blocks
+      await bot.dig(b as any);
+      await bot.waitForTicks(2);
       harvested++;
       lastProgressAt = Date.now();
       if (harvested >= want) break;
@@ -1328,32 +1335,37 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
   const radius = Number((params as any).radius ?? 3);
   const origin = bot.entity.position.floored();
   await bot.equip(hoe, 'hand');
-  let tilled = 0;
+  let tilled = 0; const attempts: Array<{x:number,y:number,z:number, ok:boolean}> = [];
   for (let dx = -radius; dx <= radius; dx++) {
     for (let dz = -radius; dz <= radius; dz++) {
       const x = origin.x + dx, z = origin.z + dz;
-      const dirtPos = new Vec3(x, origin.y, z);
-      const b = bot.blockAt(dirtPos);
-      if (!b) continue;
-      if (b.name === 'dirt' || b.name === 'grass_block' || b.name === 'grass') {
-        // Ensure air above
-        const above = bot.blockAt(dirtPos.offset(0, 1, 0));
+      // search in small vertical band around feet
+      for (let dy = -1; dy <= 2; dy++) {
+        const pos = new Vec3(x, origin.y + dy, z);
+        const b = bot.blockAt(pos);
+        if (!b) continue;
+        if (b.name !== 'dirt' && b.name !== 'grass_block') continue;
+        const above = bot.blockAt(pos.offset(0, 1, 0));
         if (!above || above.boundingBox !== 'empty') continue;
         // Move into range
-        if (bot.entity.position.distanceTo(dirtPos) > 4.5) {
+        if (bot.entity.position.distanceTo(pos) > 4.2) {
           const movements = new Movements(bot);
           bot.pathfinder.setMovements(movements);
-          bot.pathfinder.setGoal(new goals.GoalNear(dirtPos.x, dirtPos.y, dirtPos.z, 2));
+          bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 2));
           const navStart = Date.now();
-          while (Date.now() - navStart < 15000) { if (bot.entity.position.distanceTo(dirtPos) <= 4.5) break; await bot.waitForTicks(5); }
+          while (Date.now() - navStart < 15000) { if (bot.entity.position.distanceTo(pos) <= 4.2) break; await bot.waitForTicks(5); }
         }
         await bot.activateBlock(b as any);
-        tilled++;
-        await bot.waitForTicks(1);
+        await bot.waitForTicks(3);
+        const after = bot.blockAt(pos);
+        const ok = !!after && after.name === 'farmland';
+        attempts.push({ x: pos.x, y: pos.y, z: pos.z, ok });
+        if (ok) tilled++;
+        break; // stop vertical scan for this (x,z)
       }
     }
   }
-  return { ok: true, tilled };
+  return { ok: tilled > 0, tilled, attempted: attempts };
 }
 
 async function useItemOnBlockOrEntity(params: Record<string, unknown>) {
@@ -1640,16 +1652,24 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
   if (!seed) throw new Error('Seeds not in inventory');
   await bot.equip(seed, 'hand');
   const origin = bot.entity.position.floored();
-  let planted = 0; const failed: Array<{x:number,y:number,z:number}> = [];
+  let planted = 0; const failed: Array<{x:number,y:number,z:number, reason?: string}> = [];
   for (let dx = -radius; dx <= radius; dx++) {
     for (let dz = -radius; dz <= radius; dz++) {
       const x = origin.x + dx, z = origin.z + dz;
-      const pos = new Vec3(x, origin.y, z);
-      const farmland = bot.blockAt(pos);
-      const above = bot.blockAt(pos.offset(0, 1, 0));
-      if (!farmland || !above) continue;
-      if (farmland.name !== 'farmland') continue;
-      if (above.boundingBox !== 'empty') continue;
+      // scan small vertical band
+      let pos: Vec3 | null = null;
+      let farmland: any = null;
+      let above: any = null;
+      for (let dy = -1; dy <= 2; dy++) {
+        const p = new Vec3(x, origin.y + dy, z);
+        const bl = bot.blockAt(p);
+        const ab = bot.blockAt(p.offset(0,1,0));
+        if (!bl || !ab) continue;
+        if (bl.name === 'farmland' && ab.boundingBox === 'empty') {
+          pos = p; farmland = bl; above = ab; break;
+        }
+      }
+      if (!pos) continue;
       try {
         // Ensure range
         if (bot.entity.position.distanceTo(pos) > 4.5) {
@@ -1662,9 +1682,14 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
         // Use item on farmland to plant (some servers require right-click with seed)
         await bot.activateBlock(farmland as any);
         planted++;
-        await bot.waitForTicks(1);
-      } catch {
-        failed.push({ x: pos.x, y: pos.y, z: pos.z });
+        await bot.waitForTicks(3);
+        // Verify a crop appeared
+        const crop = bot.blockAt(pos.offset(0,1,0));
+        if (!crop || (crop.name !== 'wheat' && crop.name !== 'carrots' && crop.name !== 'potatoes' && crop.name !== 'beetroots')) {
+          failed.push({ x: pos.x, y: pos.y, z: pos.z, reason: 'no_crop_detected' });
+        }
+      } catch (e: any) {
+        failed.push({ x: pos.x, y: pos.y, z: pos.z, reason: String(e?.message || e) });
       }
     }
   }
@@ -1829,17 +1854,23 @@ async function gatherSeeds(params: Record<string, unknown>) {
   const countSeeds = () => bot.inventory.items().filter(i => i.name === 'wheat_seeds').reduce((a,b)=>a+b.count,0);
   const seedsStart = countSeeds();
 
-  const positions = bot.findBlocks({
-    matching: (b: any) => !!b && (b.name === 'grass' || b.name === 'tall_grass'),
-    maxDistance: radius,
-    count: 512
-  });
-  if (!positions.length) throw new Error('No grass nearby');
+  // Scan neighborhood for grass/tall_grass including upper halves
+  const origin = bot.entity.position.floored();
+  const targets: any[] = [];
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      for (let dy = -1; dy <= 2; dy++) {
+        const p = new Vec3(origin.x + dx, origin.y + dy, origin.z + dz);
+        const b = bot.blockAt(p);
+        if (!b) continue;
+        if (b.name === 'grass' || b.name === 'tall_grass') targets.push(b);
+      }
+    }
+  }
+  if (!targets.length) throw new Error('No grass nearby');
 
   let broken = 0; const errors: Array<{x:number,y:number,z:number,error:string}> = [];
-  for (const v of positions) {
-    const b = bot.blockAt(v);
-    if (!b) continue;
+  for (const b of targets) {
     try {
       // Move close
       const p: any = (b as any).position || b;
@@ -1857,7 +1888,7 @@ async function gatherSeeds(params: Record<string, unknown>) {
       }
       if (seedsNow - seedsStart >= targetSeeds) break;
     } catch (e: any) {
-      const q: any = (b as any).position || v;
+      const q: any = (b as any).position || b;
       errors.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
     }
     if (Date.now() - lastProgressAt > stallMs || Date.now() - start > maxMs) break;
