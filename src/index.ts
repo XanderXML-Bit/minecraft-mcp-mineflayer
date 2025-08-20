@@ -250,6 +250,45 @@ function isPlantObstruction(name: string): boolean {
   return flowers.some(f => n.includes(f));
 }
 
+function isClearToSkyAt(bot: Bot, pos: Vec3): boolean {
+  try {
+    for (let dy = 1; dy <= 20; dy++) {
+      const b = bot.blockAt(new Vec3(pos.x, pos.y + dy, pos.z));
+      if (b && b.boundingBox !== 'empty') return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function deriveDroppedItemInfo(entity: any, mcData: any): { id?: number; name?: string; count?: number } | null {
+  try {
+    const md = entity?.metadata;
+    if (md && typeof md === 'object') {
+      // Look for fields that resemble item info across versions
+      // Common patterns: { itemId, itemCount } or { item: { id, count } }
+      let id: number | undefined;
+      let count: number | undefined;
+      if (md.itemId != null) id = Number(md.itemId);
+      if (md.itemCount != null) count = Number(md.itemCount);
+      // Search nested objects
+      for (const key of Object.keys(md)) {
+        const val: any = (md as any)[key];
+        if (val && typeof val === 'object') {
+          if (val.itemId != null && id == null) id = Number(val.itemId);
+          if (val.itemCount != null && count == null) count = Number(val.itemCount);
+          if (val.id != null && id == null) id = Number(val.id);
+          if (val.count != null && count == null) count = Number(val.count);
+        }
+      }
+      const name = id != null ? (mcData?.items?.[id]?.name ?? mcData?.itemsByName?.[id]?.name) : undefined;
+      return { id, name, count };
+    }
+  } catch {}
+  return null;
+}
+
 // Durability helpers
 function getItemDurabilityInfo(mcData: any, item: any) {
   if (!item) return null;
@@ -381,6 +420,8 @@ async function joinGame(params: Record<string, unknown>) {
         time: Date.now(),
         cause: (bot as any).lastDeathCause || 'unknown'
       };
+      // Persist last death position for return tool
+      (bot as any).__lastDeathPosition = (bot as any).__lastDeath?.position;
     });
     bot.on('message', (jsonMsg: any) => {
       const text = jsonMsg?.toString?.() ?? String(jsonMsg?.text ?? "");
@@ -1313,6 +1354,39 @@ async function retrieveItemsFromNearbyFurnace(params: Record<string, unknown>) {
   return { ok: !!out, output: out?.name };
 }
 
+// Return to last death position and collect nearby drops (10-block radius)
+async function returnToLastDeathLocation(params: Record<string, unknown>) {
+  const bot = getBotOrThrow(String(params.username || ""));
+  const last = (bot as any).__lastDeathPosition;
+  if (!last || last.x == null) throw new Error('No last death position recorded');
+  const target = new Vec3(Number(last.x), Number(last.y), Number(last.z));
+  const movements = new Movements(bot);
+  bot.pathfinder.setMovements(movements);
+  bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
+  // wait up to 60s to arrive
+  const begin = Date.now();
+  while (Date.now() - begin < 60000) {
+    const d = bot.entity.position.distanceTo(target);
+    if (d <= 3) break;
+    await bot.waitForTicks(5);
+  }
+  const arrived = bot.entity.position.distanceTo(target) <= 3;
+  // Collect items within 10 blocks
+  let pickedUp = 0;
+  if (arrived) {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      const item = bot.nearestEntity((e: any) => e.type === 'object' && e.position.distanceTo(target) <= 10);
+      if (!item) break;
+      bot.pathfinder.setGoal(new goals.GoalFollow(item, 1));
+      // brief wait to pick it up
+      await bot.waitForTicks(20);
+      pickedUp++;
+    }
+  }
+  return { ok: arrived, arrived, pickedUp };
+}
+
 async function placeItemNearYou(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   const itemName = String(params.itemName || params.name || 'cobblestone');
@@ -1624,14 +1698,17 @@ async function goToSurface(params: Record<string, unknown>) {
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
-  // Wait up to 60s
+  // Wait until at surface: close to target and clear to sky at current pos
   const begin = Date.now();
-  while (Date.now() - begin < 60000) {
+  const maxMs = Number((params as any).maxMs ?? 90000);
+  let arrived = false;
+  while (Date.now() - begin < maxMs) {
     const d = bot.entity.position.distanceTo(target);
-    if (d <= 3) break;
+    const near = d <= 3;
+    const clear = isClearToSkyAt(bot, bot.entity.position.floored());
+    if (near && clear) { arrived = true; break; }
     await bot.waitForTicks(5);
   }
-  const arrived = bot.entity.position.distanceTo(target) <= 3;
   return { ok: arrived, arrived };
 }
 
@@ -1703,7 +1780,15 @@ async function scanArea(params: Record<string, unknown>) {
   }
   const entities = Object.values(bot.entities).filter((e: any) => e.position && e.position.distanceTo(bot.entity.position) <= radius + 2)
     .map((e: any) => ({ id: e.id, name: e.name || e.username || e.displayName, type: e.type, position: { x: e.position.x, y: e.position.y, z: e.position.z } }));
-  return { ok: true, blocks: blockCounts, samples: sampleCoords, entities };
+  // Items on ground (entity.type === 'object')
+  const mcData = (bot as any).__mcdata;
+  const dropped = Object.values(bot.entities)
+    .filter((e: any) => e.type === 'object' && e.position && e.position.distanceTo(bot.entity.position) <= radius + 2)
+    .map((e: any) => {
+      const info = deriveDroppedItemInfo(e, mcData);
+      return { id: e.id, position: { x: e.position.x, y: e.position.y, z: e.position.z }, item: info };
+    });
+  return { ok: true, blocks: blockCounts, samples: sampleCoords, entities, droppedItems: dropped };
 }
 
 // Plant seeds within radius
@@ -2027,6 +2112,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "findBlock": action = await findBlock(args); break;
       case "findEntity": action = await findEntity(args); break;
       case "scanArea": action = await scanArea(args); break;
+      case "returnToLastDeathLocation": action = await returnToLastDeathLocation(args); break;
       case "plantSeedsWithinRadius": action = await plantSeedsWithinRadius(args); break;
       case "gatherSeeds": action = await gatherSeeds(args); break;
       case "stopAttack": action = await stopAttack(args); break;
@@ -2107,7 +2193,8 @@ function listTools() {
     ,{ name: "goToSurface", description: "Move to the nearest surface above the bot", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "findBlock", description: "Find nearest block of a type", inputSchema: { type: "object", properties: { username: { type: "string" }, blockName: { type: "string" } }, required: ["blockName"] } }
     ,{ name: "findEntity", description: "Find nearest entity of a type", inputSchema: { type: "object", properties: { username: { type: "string" }, targetName: { type: "string" }, type: { type: "string" } } } }
-    ,{ name: "scanArea", description: "Scan blocks/entities within radius with counts and sample coordinates", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
+    ,{ name: "scanArea", description: "Scan blocks/entities within radius with counts and sample coordinates; includes dropped items", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
+    ,{ name: "returnToLastDeathLocation", description: "Return to recorded death position and collect drops nearby", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "plantSeedsWithinRadius", description: "Plant seeds on nearby farmland within radius", inputSchema: { type: "object", properties: { username: { type: "string" }, seedName: { type: "string" }, radius: { type: "number" } } } }
     ,{ name: "gatherSeeds", description: "Break grass to collect wheat_seeds until count reached", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" }, radius: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "stopAttack", description: "Stop current attack", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
