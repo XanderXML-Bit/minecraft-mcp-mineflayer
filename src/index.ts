@@ -212,6 +212,21 @@ function resolveBlockAliases(name: string, mcData: any): string[] {
   return all.filter((b: string) => b.includes(n));
 }
 
+function isWaterLike(block: any): boolean {
+  if (!block) return false;
+  const n = String(block.name || '').toLowerCase();
+  const liquid = Boolean((block as any).liquid);
+  const waterlogged = Boolean((block as any).getProperties?.()?.waterlogged);
+  return liquid || waterlogged || n === 'water' || n.endsWith('_water');
+}
+
+function isPlantObstruction(name: string): boolean {
+  const n = name.toLowerCase();
+  if (n === 'grass' || n === 'tall_grass' || n === 'fern' || n === 'large_fern' || n === 'dead_bush') return true;
+  const flowers = ['flower','dandelion','poppy','orchid','allium','azure_bluet','oxeye_daisy','cornflower','lily_of_the_valley','wither_rose','tulip','sunflower','lilac','rose_bush','peony'];
+  return flowers.some(f => n.includes(f));
+}
+
 // Durability helpers
 function getItemDurabilityInfo(mcData: any, item: any) {
   if (!item) return null;
@@ -1333,6 +1348,8 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
   const hoe = bot.inventory.items().find(i => i.name?.includes('hoe'));
   if (!hoe) throw new Error('No hoe in inventory');
   const radius = Number((params as any).radius ?? 3);
+  const requireWater = Boolean((params as any).requireWater ?? true);
+  const waterRadius = Math.max(1, Math.min(6, Number((params as any).waterRadius ?? 4)));
   const origin = bot.entity.position.floored();
   await bot.equip(hoe, 'hand');
   let tilled = 0; const attempts: Array<{x:number,y:number,z:number, ok:boolean}> = [];
@@ -1346,7 +1363,27 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
         if (!b) continue;
         if (b.name !== 'dirt' && b.name !== 'grass_block') continue;
         const above = bot.blockAt(pos.offset(0, 1, 0));
-        if (!above || above.boundingBox !== 'empty') continue;
+        if (!above) continue;
+        // If obstruction (grass/flower), clear it first
+        if (above.boundingBox !== 'empty' && isPlantObstruction(above.name)) {
+          try { await bot.dig(above as any); await bot.waitForTicks(2); } catch {}
+        }
+        const above2 = bot.blockAt(pos.offset(0, 1, 0));
+        if (!above2 || above2.boundingBox !== 'empty') continue;
+        // Optional water proximity requirement (hydration)
+        if (requireWater) {
+          let waterFound = false;
+          for (let rx = -waterRadius; rx <= waterRadius && !waterFound; rx++) {
+            for (let rz = -waterRadius; rz <= waterRadius && !waterFound; rz++) {
+              for (let ry = -1; ry <= 1 && !waterFound; ry++) {
+                const wp = pos.offset(rx, ry, rz);
+                const w = bot.blockAt(wp);
+                if (isWaterLike(w)) waterFound = true;
+              }
+            }
+          }
+          if (!waterFound) continue;
+        }
         // Move into range
         if (bot.entity.position.distanceTo(pos) > 4.2) {
           const movements = new Movements(bot);
@@ -1854,7 +1891,7 @@ async function gatherSeeds(params: Record<string, unknown>) {
   const countSeeds = () => bot.inventory.items().filter(i => i.name === 'wheat_seeds').reduce((a,b)=>a+b.count,0);
   const seedsStart = countSeeds();
 
-  // Scan neighborhood for grass/tall_grass including upper halves
+  // Scan neighborhood for grass/tall_grass (both halves) and ferns small plants
   const origin = bot.entity.position.floored();
   const targets: any[] = [];
   for (let dx = -radius; dx <= radius; dx++) {
@@ -1863,7 +1900,7 @@ async function gatherSeeds(params: Record<string, unknown>) {
         const p = new Vec3(origin.x + dx, origin.y + dy, origin.z + dz);
         const b = bot.blockAt(p);
         if (!b) continue;
-        if (b.name === 'grass' || b.name === 'tall_grass') targets.push(b);
+        if (b.name === 'grass' || b.name === 'tall_grass' || b.name === 'fern' || b.name === 'large_fern') targets.push(b);
       }
     }
   }
@@ -2028,7 +2065,7 @@ function listTools() {
     ,{ name: "cookWithCampfire", description: "Cook items on a campfire (no fuel, slower)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "retrieveItemsFromNearbyFurnace", description: "Get smelted items from furnace", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "placeItemNearYou", description: "Place blocks near the bot", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
-    ,{ name: "prepareLandForFarming", description: "Prepare land for farming (till dirt/grass into farmland)", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
+    ,{ name: "prepareLandForFarming", description: "Prepare land for farming (till near water; clears plants)", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" }, requireWater: { type: "boolean" }, waterRadius: { type: "number" } } } }
     ,{ name: "useItemOnBlockOrEntity", description: "Use items on blocks or entities", inputSchema: { type: "object", properties: { username: { type: "string" }, x: { type: "number" }, y: { type: "number" }, z: { type: "number" }, userName: { type: "string" } } } }
     ,{ name: "rest", description: "Rest to regain health (wait)", inputSchema: { type: "object", properties: { ms: { type: "number" } } } }
     ,{ name: "sleepInNearbyBed", description: "Find and sleep in a bed; if daytime, set spawn on the bed", inputSchema: { type: "object", properties: { username: { type: "string" }, setSpawnIfDay: { type: "boolean" } } } }
