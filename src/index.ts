@@ -141,8 +141,53 @@ function getStatus(bot: Bot) {
   const lastDeath = (bot as any).__lastDeath || null;
   const isDrowning = bot.oxygenLevel !== undefined && bot.oxygenLevel < 10;
   const effects = Object.values((bot as any).__effects || {}).map((e: any) => ({ id: e.id, amplifier: e.amplifier, duration: e.duration }));
+  const pos = bot.entity?.position;
+  const posObj = pos ? { x: pos.x, y: pos.y, z: pos.z } : undefined;
+  // Time of day
+  let timeOfDay: number | undefined;
+  let isDay: boolean | undefined;
+  try {
+    const t = (bot as any).time?.timeOfDay ?? (bot as any).time?.time ?? undefined;
+    if (typeof t === 'number') {
+      timeOfDay = t % 24000;
+      isDay = timeOfDay < 12000;
+    }
+  } catch {}
+  // Biome name if available
+  let biome: string | undefined;
+  try {
+    const feet = bot.blockAt(bot.entity.position.floored());
+    const biomeId = (feet as any)?.biome?.id ?? (feet as any)?.biome;
+    const mcData = (bot as any).__mcdata;
+    if (mcData && biomeId != null) {
+      const b = (mcData as any).biomes?.[biomeId];
+      biome = b?.name ?? String(biomeId);
+    }
+  } catch {}
+  // Area classification
+  let area: 'outside'|'underground'|'in_water'|'underwater'|undefined;
+  const isInWater = !!(bot as any).isInWater;
+  const underwater = isInWater && (bot.oxygenLevel != null) && bot.oxygenLevel < 20;
+  if (underwater) area = 'underwater';
+  else if (isInWater) area = 'in_water';
+  else {
+    try {
+      const head = bot.entity.position.floored().offset(0, 1, 0);
+      let clearAbove = true;
+      for (let dy = 0; dy < 20; dy++) {
+        const b = bot.blockAt(head.offset(0, dy, 0));
+        if (b && b.boundingBox !== 'empty') { clearAbove = false; break; }
+      }
+      area = clearAbove ? 'outside' : 'underground';
+    } catch {}
+  }
   const env = {
-    isInWater: !!(bot as any).isInWater,
+    position: posObj,
+    timeOfDay,
+    isDay,
+    biome,
+    area,
+    isInWater,
     isOnGround: !!(bot.entity?.onGround),
     oxygenLevel: bot.oxygenLevel,
     isDrowning
@@ -672,6 +717,7 @@ async function mineResource(params: Record<string, unknown>) {
 async function harvestMatureCrops(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   const crops = ['wheat', 'carrots', 'potatoes', 'beetroots'];
+  const want = Math.max(1, Number((params as any).count ?? 8));
   const positions = bot.findBlocks({
     matching: (b: any) => {
       if (!b) return false;
@@ -680,26 +726,35 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
       return age >= 7;
     },
     maxDistance: 64,
-    count: Number(params.count ?? 8)
+    count: want
   });
   if (!positions.length) throw new Error('No mature crops found');
   const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
-  let harvested = 0; const failed: Array<{x:number,y:number,z:number}> = [];
-  const maxMs = Number((params as any).maxMs ?? 90000);
+  let harvested = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
+  const maxMs = Number((params as any).maxMs ?? 120000);
   const start = Date.now();
+  let lastProgressAt = start;
   for (const b of blocks) {
     if (Date.now() - start > maxMs) break;
     try {
-      // @ts-ignore
-      await bot.collectBlock.collect(b);
-      harvested++;
-    } catch {
       const p: any = (b as any).position || b;
-      failed.push({ x: p.x, y: p.y, z: p.z });
+      const movements = new Movements(bot);
+      bot.pathfinder.setMovements(movements);
+      bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
+      const navStart = Date.now();
+      while (Date.now() - navStart < 20000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
+      await collectBlockWithTimeout(bot, b, 25000);
+      harvested++;
+      lastProgressAt = Date.now();
+      if (harvested >= want) break;
+    } catch (e: any) {
+      const q: any = (b as any).position || b;
+      failed.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
     }
+    if (Date.now() - lastProgressAt > 20000) break; // stall protection
   }
   const timedOut = Date.now() - start > maxMs;
-  return { ok: harvested > 0, harvested, failed, timedOut };
+  return { ok: harvested > 0, requested: want, harvested, remaining: Math.max(0, want - harvested), failed, timedOut };
 }
 
 async function pickupItem(params: Record<string, unknown>) {
@@ -712,7 +767,7 @@ async function pickupItem(params: Record<string, unknown>) {
   bot.pathfinder.setGoal(new goals.GoalFollow(ent, 1));
   // wait up to 20 seconds to pick up and report partial
   const start = Date.now();
-  const maxMs = Number((params as any).maxMs ?? 20000);
+  const maxMs = Number((params as any).maxMs ?? 30000);
   let pickedUp = false;
   while (Date.now() - start < maxMs) {
     await bot.waitForTicks(5);
@@ -1280,7 +1335,18 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
       const dirtPos = new Vec3(x, origin.y, z);
       const b = bot.blockAt(dirtPos);
       if (!b) continue;
-      if (b.name === 'dirt' || b.name === 'grass_block') {
+      if (b.name === 'dirt' || b.name === 'grass_block' || b.name === 'grass') {
+        // Ensure air above
+        const above = bot.blockAt(dirtPos.offset(0, 1, 0));
+        if (!above || above.boundingBox !== 'empty') continue;
+        // Move into range
+        if (bot.entity.position.distanceTo(dirtPos) > 4.5) {
+          const movements = new Movements(bot);
+          bot.pathfinder.setMovements(movements);
+          bot.pathfinder.setGoal(new goals.GoalNear(dirtPos.x, dirtPos.y, dirtPos.z, 2));
+          const navStart = Date.now();
+          while (Date.now() - navStart < 15000) { if (bot.entity.position.distanceTo(dirtPos) <= 4.5) break; await bot.waitForTicks(5); }
+        }
         await bot.activateBlock(b as any);
         tilled++;
         await bot.waitForTicks(1);
@@ -1315,9 +1381,23 @@ async function rest(params: Record<string, unknown>) {
 
 async function sleepInNearbyBed(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  const setSpawn = Boolean((params as any).setSpawnIfDay ?? true);
   const bedPos = await pathfindToPredicate(bot, (b: any) => b?.name?.includes('bed'), 24, 1);
+  // If daytime and setSpawn requested, use bed to set spawn point instead of sleeping
+  try {
+    const tod = (bot as any).time?.timeOfDay ?? (bot as any).time?.time;
+    const isDay = typeof tod === 'number' ? (tod % 24000) < 12000 : false;
+    if (setSpawn && isDay) {
+      // Mineflayer: right-click bed in daytime sets spawn
+      const bed = bot.blockAt((bedPos as any).position || (bedPos as any));
+      if (bed) {
+        await bot.activateBlock(bed as any);
+        return { ok: true, action: 'set_spawn' };
+      }
+    }
+  } catch {}
   await bot.sleep(bedPos as any);
-  return { ok: true };
+  return { ok: true, action: 'slept' };
 }
 
 async function dance(params: Record<string, unknown>) {
@@ -1334,13 +1414,36 @@ async function dance(params: Record<string, unknown>) {
 
 async function buildSomething(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
-  const cmds = params.commands as string[] | undefined;
-  if (!Array.isArray(cmds) || cmds.length === 0) throw new Error('Provide commands array');
-  for (const c of cmds) {
-    const cmd = c.trim().startsWith('/') ? c.trim() : `/${c.trim()}`;
-    bot.chat(cmd);
+  const mode = String((params as any).mode ?? 'commands'); // 'commands' | 'survival'
+  if (mode === 'commands') {
+    const cmds = (params as any).commands as string[] | undefined;
+    if (!Array.isArray(cmds) || cmds.length === 0) throw new Error('Provide commands array');
+    for (const c of cmds) {
+      const cmd = c.trim().startsWith('/') ? c.trim() : `/${c.trim()}`;
+      bot.chat(cmd);
+    }
+    return { ok: true, mode };
   }
-  return { ok: true };
+  // survival build: requires coordinates and itemName in inventory
+  const x = Number((params as any).x);
+  const y = Number((params as any).y);
+  const z = Number((params as any).z);
+  const itemName = String((params as any).itemName || '');
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) throw new Error('Provide x,y,z');
+  if (!itemName) throw new Error('itemName required');
+  const item = bot.inventory.items().find(i => i.name === itemName);
+  if (!item) throw new Error('Item not in inventory');
+  const support = bot.blockAt(new Vec3(x, y - 1, z));
+  if (!support) throw new Error('No support block below target');
+  await bot.equip(item, 'hand');
+  // Navigate close
+  const movements = new Movements(bot);
+  bot.pathfinder.setMovements(movements);
+  bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, 2));
+  const begin = Date.now();
+  while (Date.now() - begin < 20000) { if (bot.entity.position.distanceTo(new Vec3(x,y,z)) <= 4.5) break; await bot.waitForTicks(5); }
+  await bot.placeBlock(support as any, new Vec3(0, 1, 0));
+  return { ok: true, mode };
 }
 
 async function depositItemsToNearbyChest(params: Record<string, unknown>) {
@@ -1400,6 +1503,15 @@ async function placeBlockAt(params: Record<string, unknown>) {
   const below = bot.blockAt(new Vec3(x, y - 1, z));
   if (!below) throw new Error('No support block below target');
   await bot.equip(item, 'hand');
+  // Move into range if needed
+  const targetVec = new Vec3(x, y, z);
+  if (bot.entity.position.distanceTo(targetVec) > 4.5) {
+    const movements = new Movements(bot);
+    bot.pathfinder.setMovements(movements);
+    bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, 2));
+    const start = Date.now();
+    while (Date.now() - start < 20000) { if (bot.entity.position.distanceTo(targetVec) <= 4.5) break; await bot.waitForTicks(5); }
+  }
   await bot.placeBlock(below as any, new Vec3(0, 1, 0));
   return { ok: true };
 }
@@ -1416,6 +1528,36 @@ async function detectGamemode(params: Record<string, unknown>) {
   const gmNum = Number(bot.game?.gameMode);
   const map: Record<number, string> = { 0: 'survival', 1: 'creative', 2: 'adventure', 3: 'spectator' };
   return { ok: true, gameMode: map[gmNum] ?? String(gmNum) };
+}
+
+async function goToSurface(params: Record<string, unknown>) {
+  const bot = getBotOrThrow(String(params.username || ""));
+  // Move up until we find sky exposure or y increases to a safe threshold
+  const start = bot.entity.position.floored();
+  let target: Vec3 | null = null;
+  for (let dy = 0; dy < 64; dy++) {
+    const y = start.y + dy;
+    const head = new Vec3(start.x, y + 1, start.z);
+    let clearAbove = true;
+    for (let ay = 0; ay < 20; ay++) {
+      const b = bot.blockAt(head.offset(0, ay, 0));
+      if (b && b.boundingBox !== 'empty') { clearAbove = false; break; }
+    }
+    if (clearAbove) { target = new Vec3(start.x, y, start.z); break; }
+  }
+  if (!target) throw new Error('No clear surface found above');
+  const movements = new Movements(bot);
+  bot.pathfinder.setMovements(movements);
+  bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
+  // Wait up to 60s
+  const begin = Date.now();
+  while (Date.now() - begin < 60000) {
+    const d = bot.entity.position.distanceTo(target);
+    if (d <= 3) break;
+    await bot.waitForTicks(5);
+  }
+  const arrived = bot.entity.position.distanceTo(target) <= 3;
+  return { ok: arrived, arrived };
 }
 
 async function findBlock(params: Record<string, unknown>) {
@@ -1464,9 +1606,10 @@ async function stopFollow(params: Record<string, unknown>) {
 // Scan area for blocks/entities
 async function scanArea(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
-  const radius = Math.max(1, Math.min(8, Number((params as any).radius ?? 5)));
+  const radius = Math.max(1, Math.min(12, Number((params as any).radius ?? 6)));
   const origin = bot.entity.position.floored();
   const blockCounts: Record<string, number> = {};
+  const sampleCoords: Record<string, Array<{x:number,y:number,z:number}>> = {};
   for (let dx = -radius; dx <= radius; dx++) {
     for (let dy = -Math.min(4, radius); dy <= Math.min(4, radius); dy++) {
       for (let dz = -radius; dz <= radius; dz++) {
@@ -1474,12 +1617,18 @@ async function scanArea(params: Record<string, unknown>) {
         if (!b) continue;
         if (b.boundingBox === 'empty') continue;
         blockCounts[b.name] = (blockCounts[b.name] || 0) + 1;
+        const key = b.name;
+        if (!sampleCoords[key]) sampleCoords[key] = [];
+        if (sampleCoords[key].length < 5) {
+          const p: any = (b as any).position || new Vec3(origin.x + dx, origin.y + dy, origin.z + dz);
+          sampleCoords[key].push({ x: p.x, y: p.y, z: p.z });
+        }
       }
     }
   }
   const entities = Object.values(bot.entities).filter((e: any) => e.position && e.position.distanceTo(bot.entity.position) <= radius + 2)
-    .map((e: any) => ({ id: e.id, name: e.name || e.username || e.displayName, type: e.type }));
-  return { ok: true, blocks: blockCounts, entities };
+    .map((e: any) => ({ id: e.id, name: e.name || e.username || e.displayName, type: e.type, position: { x: e.position.x, y: e.position.y, z: e.position.z } }));
+  return { ok: true, blocks: blockCounts, samples: sampleCoords, entities };
 }
 
 // Plant seeds within radius
@@ -1502,6 +1651,15 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
       if (farmland.name !== 'farmland') continue;
       if (above.boundingBox !== 'empty') continue;
       try {
+        // Ensure range
+        if (bot.entity.position.distanceTo(pos) > 4.5) {
+          const movements = new Movements(bot);
+          bot.pathfinder.setMovements(movements);
+          bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 2));
+          const navStart = Date.now();
+          while (Date.now() - navStart < 15000) { if (bot.entity.position.distanceTo(pos) <= 4.5) break; await bot.waitForTicks(5); }
+        }
+        // Use item on farmland to plant (some servers require right-click with seed)
         await bot.activateBlock(farmland as any);
         planted++;
         await bot.waitForTicks(1);
@@ -1644,11 +1802,9 @@ async function giveItemToSomeone(params: Record<string, unknown>) {
 }
 
 async function lookAround(params: Record<string, unknown>) {
+  // Deprecated in favor of scanArea; keep for backward compatibility but no-op fast
   const bot = getBotOrThrow(String(params.username || ""));
-  const yaw = Number(params.yaw ?? Math.random() * Math.PI * 2);
-  const pitch = Number(params.pitch ?? (Math.random() - 0.5));
-  await bot.look(yaw, pitch, true);
-  return { ok: true };
+  return { ok: true, deprecated: true };
 }
 
 async function eatFood(params: Record<string, unknown>) {
@@ -1714,6 +1870,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "openNearbyChest": action = await openNearbyChest(args); break;
       case "dance": action = await dance(args); break;
       case "buildSomething": action = await buildSomething(args); break;
+      case "goToSurface": action = await goToSurface(args); break;
       case "depositItemsToNearbyChest": action = await depositItemsToNearbyChest(args); break;
       case "withdrawItemsFromNearbyChest": action = await withdrawItemsFromNearbyChest(args); break;
       case "digBlock": action = await digBlock(args); break;
@@ -1774,7 +1931,7 @@ function listTools() {
     ,{ name: "swimToLand", description: "Swim to nearest land when in water", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "hunt", description: "Hunt animals or mobs until count reached (kills)", inputSchema: { type: "object", properties: { username: { type: "string" }, targetName: { type: "string" }, targetType: { type: "string" }, count: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "mineResource", description: "Mine specific blocks or resources", inputSchema: { type: "object", properties: { username: { type: "string" }, blockName: { type: "string" }, count: { type: "number" } }, required: ["blockName"] } }
-    ,{ name: "harvestMatureCrops", description: "Harvest mature crops from farmland", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" } } } }
+    ,{ name: "harvestMatureCrops", description: "Harvest mature crops from farmland with progress timeouts", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "pickupItem", description: "Pick up items from the ground", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } } } }
     ,{ name: "craftItems", description: "Craft items using a crafting table", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, count: { type: "number" } }, required: ["itemName"] } }
     ,{ name: "listRecipes", description: "List recipes for an item and how many are craftable with current inventory", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
@@ -1786,23 +1943,24 @@ function listTools() {
     ,{ name: "cookWithCampfire", description: "Cook items on a campfire (no fuel, slower)", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "retrieveItemsFromNearbyFurnace", description: "Get smelted items from furnace", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "placeItemNearYou", description: "Place blocks near the bot", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
-    ,{ name: "prepareLandForFarming", description: "Prepare land for farming", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
+    ,{ name: "prepareLandForFarming", description: "Prepare land for farming (till dirt/grass into farmland)", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
     ,{ name: "useItemOnBlockOrEntity", description: "Use items on blocks or entities", inputSchema: { type: "object", properties: { username: { type: "string" }, x: { type: "number" }, y: { type: "number" }, z: { type: "number" }, userName: { type: "string" } } } }
     ,{ name: "rest", description: "Rest to regain health (wait)", inputSchema: { type: "object", properties: { ms: { type: "number" } } } }
-    ,{ name: "sleepInNearbyBed", description: "Find and sleep in a bed", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
+    ,{ name: "sleepInNearbyBed", description: "Find and sleep in a bed; if daytime, set spawn on the bed", inputSchema: { type: "object", properties: { username: { type: "string" }, setSpawnIfDay: { type: "boolean" } } } }
     ,{ name: "openNearbyChest", description: "Open a nearby chest", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "dance", description: "Make the bot dance", inputSchema: { type: "object", properties: { username: { type: "string" }, durationMs: { type: "number" } } } }
-    ,{ name: "buildSomething", description: "Build structures using commands (op required)", inputSchema: { type: "object", properties: { username: { type: "string" }, commands: { type: "array", items: { type: "string" } } }, required: ["commands"] } }
+    ,{ name: "buildSomething", description: "Build structures using commands (creative) or survival placement", inputSchema: { type: "object", properties: { username: { type: "string" }, mode: { type: "string", enum: ["commands","survival"] }, commands: { type: "array", items: { type: "string" } }, x: { type: "number" }, y: { type: "number" }, z: { type: "number" }, itemName: { type: "string" } } } }
     ,{ name: "depositItemsToNearbyChest", description: "Deposit items to nearby chest", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, count: { type: "number" } }, required: ["itemName"] } }
     ,{ name: "withdrawItemsFromNearbyChest", description: "Withdraw items from nearby chest", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, count: { type: "number" } }, required: ["itemName"] } }
     ,{ name: "digBlock", description: "Dig a block at coordinates", inputSchema: { type: "object", properties: { username: { type: "string" }, x: { type: "number" }, y: { type: "number" }, z: { type: "number" } }, required: ["x","y","z"] } }
     ,{ name: "placeBlockAt", description: "Place a block at coordinates", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, x: { type: "number" }, y: { type: "number" }, z: { type: "number" } }, required: ["itemName","x","y","z"] } }
     ,{ name: "listInventory", description: "List inventory items", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "detectGamemode", description: "Detect current game mode", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
+    ,{ name: "goToSurface", description: "Move to the nearest surface above the bot", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     ,{ name: "findBlock", description: "Find nearest block of a type", inputSchema: { type: "object", properties: { username: { type: "string" }, blockName: { type: "string" } }, required: ["blockName"] } }
     ,{ name: "findEntity", description: "Find nearest entity of a type", inputSchema: { type: "object", properties: { username: { type: "string" }, targetName: { type: "string" }, type: { type: "string" } } } }
-    ,{ name: "scanArea", description: "Scan blocks/entities within radius", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
-    ,{ name: "plantSeedsWithinRadius", description: "Plant seeds in radius", inputSchema: { type: "object", properties: { username: { type: "string" }, seedName: { type: "string" }, radius: { type: "number" } } } }
+    ,{ name: "scanArea", description: "Scan blocks/entities within radius with counts and sample coordinates", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
+    ,{ name: "plantSeedsWithinRadius", description: "Plant seeds on nearby farmland within radius", inputSchema: { type: "object", properties: { username: { type: "string" }, seedName: { type: "string" }, radius: { type: "number" } } } }
     ,{ name: "stopAttack", description: "Stop current attack", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     
   ];
