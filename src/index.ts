@@ -1199,11 +1199,19 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
     let toProcess = Math.max(1, Math.min(count, available));
     if (toProcess <= 0) throw new Error(`Missing input '${itemName}'`);
     // Ensure fuel present
-    if (!furnace.fuelItem()) {
-      const fuel = fuelName ? bot.inventory.items().find(i => i.name === fuelName)
+    const findFuel = () => {
+      const f = fuelName ? bot.inventory.items().find(i => i.name === fuelName)
         : bot.inventory.items().find(i => ['coal','charcoal','coal_block','lava_bucket','stick','oak_planks','spruce_planks','birch_planks','jungle_planks','acacia_planks','dark_oak_planks','mangrove_planks','cherry_planks','bamboo_planks','crimson_planks','warped_planks'].includes(i.name));
-      if (!fuel) throw new Error('Missing fuel');
-      await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count));
+      return f || null;
+    };
+    if (!furnace.fuelItem()) {
+      const fuel = findFuel();
+      if (fuel) {
+        await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count));
+      } else {
+        // Start without fuel: report immediately
+        return { ok: false, deviceUsed: device, outputsCollected: 0, requested: count, remaining: count, outOfFuel: true, reason: 'missing_fuel' };
+      }
     }
     // Insert inputs in batches
     let inserted = 0;
@@ -1220,6 +1228,8 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
     const deadline = Date.now() + (totalMaxMs ?? Math.max(90000, 60000 * outputsTarget));
     let lastProgressAt = Date.now();
     let lastOutName: string | undefined;
+    let outOfFuel = false;
+    let refuelAttempts = 0;
     while (outputs < outputsTarget && Date.now() < deadline) {
       await bot.waitForTicks(10);
       try {
@@ -1230,10 +1240,29 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
           lastProgressAt = Date.now();
         }
       } catch {}
-      if (Date.now() - lastProgressAt > 15000) break; // stalled smelting
+      // Attempt refuel on stall
+      if (Date.now() - lastProgressAt > 15000) {
+        const hasFuelNow = !!furnace.fuelItem();
+        if (!hasFuelNow) {
+          const fuel = findFuel();
+          if (fuel && refuelAttempts < 2) {
+            try {
+              await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count));
+              refuelAttempts++;
+              lastProgressAt = Date.now();
+              continue;
+            } catch {}
+          }
+          outOfFuel = true;
+          break;
+        }
+        break; // stalled for another reason
+      }
     }
-    const timedOut = outputs < outputsTarget;
-    return { ok: outputs > 0 && !timedOut, deviceUsed: device, outputsCollected: outputs, requested: count, remaining: Math.max(0, count - outputs), timedOut, output: lastOutName };
+    const timedOut = outputs < outputsTarget && Date.now() >= deadline;
+    const stalled = outputs < outputsTarget && !timedOut && !outOfFuel;
+    const reason = outOfFuel ? 'out_of_fuel' : timedOut ? 'timed_out' : (stalled ? 'stalled' : undefined);
+    return { ok: outputs >= outputsTarget, deviceUsed: device, outputsCollected: outputs, requested: count, remaining: Math.max(0, count - outputs), timedOut, stalled, outOfFuel, reason, output: lastOutName };
   } finally {
     try { furnace.close(); } catch {}
   }
