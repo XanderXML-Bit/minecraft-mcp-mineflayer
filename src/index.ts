@@ -1816,6 +1816,59 @@ async function eatFood(params: Record<string, unknown>) {
   return { ok: true };
 }
 
+// Gather wheat seeds by breaking nearby grass/tall_grass until count reached
+async function gatherSeeds(params: Record<string, unknown>) {
+  const bot = getBotOrThrow(String(params.username || ""));
+  const targetSeeds = Math.max(1, Number((params as any).count ?? 8));
+  const radius = Math.max(2, Math.min(32, Number((params as any).radius ?? 8)));
+  const maxMs = Number((params as any).maxMs ?? 120000);
+  const start = Date.now();
+  let lastProgressAt = start;
+  const stallMs = 20000;
+
+  const countSeeds = () => bot.inventory.items().filter(i => i.name === 'wheat_seeds').reduce((a,b)=>a+b.count,0);
+  const seedsStart = countSeeds();
+
+  const positions = bot.findBlocks({
+    matching: (b: any) => !!b && (b.name === 'grass' || b.name === 'tall_grass'),
+    maxDistance: radius,
+    count: 512
+  });
+  if (!positions.length) throw new Error('No grass nearby');
+
+  let broken = 0; const errors: Array<{x:number,y:number,z:number,error:string}> = [];
+  for (const v of positions) {
+    const b = bot.blockAt(v);
+    if (!b) continue;
+    try {
+      // Move close
+      const p: any = (b as any).position || b;
+      const movements = new Movements(bot);
+      bot.pathfinder.setMovements(movements);
+      bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
+      const navStart = Date.now();
+      while (Date.now() - navStart < 15000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
+      await bot.dig(b as any);
+      broken++;
+      await bot.waitForTicks(2);
+      const seedsNow = countSeeds();
+      if (seedsNow > seedsStart) {
+        lastProgressAt = Date.now();
+      }
+      if (seedsNow - seedsStart >= targetSeeds) break;
+    } catch (e: any) {
+      const q: any = (b as any).position || v;
+      errors.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
+    }
+    if (Date.now() - lastProgressAt > stallMs || Date.now() - start > maxMs) break;
+  }
+  const seedsEnd = countSeeds();
+  const gained = Math.max(0, seedsEnd - seedsStart);
+  const timedOut = Date.now() - start > maxMs;
+  const stalled = Date.now() - lastProgressAt > stallMs && gained < targetSeeds;
+  return { ok: gained > 0, requested: targetSeeds, seeds: gained, remaining: Math.max(0, targetSeeds - gained), broken, timedOut, stalled, errors };
+}
+
 async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   let action: any = null;
   try {
@@ -1881,6 +1934,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "findEntity": action = await findEntity(args); break;
       case "scanArea": action = await scanArea(args); break;
       case "plantSeedsWithinRadius": action = await plantSeedsWithinRadius(args); break;
+      case "gatherSeeds": action = await gatherSeeds(args); break;
       case "stopAttack": action = await stopAttack(args); break;
       case "stopAllTasks": action = await stopAllTasks(args); break;
       // selfDefense removed
@@ -1961,6 +2015,7 @@ function listTools() {
     ,{ name: "findEntity", description: "Find nearest entity of a type", inputSchema: { type: "object", properties: { username: { type: "string" }, targetName: { type: "string" }, type: { type: "string" } } } }
     ,{ name: "scanArea", description: "Scan blocks/entities within radius with counts and sample coordinates", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" } } } }
     ,{ name: "plantSeedsWithinRadius", description: "Plant seeds on nearby farmland within radius", inputSchema: { type: "object", properties: { username: { type: "string" }, seedName: { type: "string" }, radius: { type: "number" } } } }
+    ,{ name: "gatherSeeds", description: "Break grass to collect wheat_seeds until count reached", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" }, radius: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "stopAttack", description: "Stop current attack", inputSchema: { type: "object", properties: { username: { type: "string" } } } }
     
   ];
