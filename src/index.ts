@@ -162,6 +162,7 @@ function getStatus(bot: Bot) {
   const lastBroken = (bot as any).__lastBroken || null;
   const lastDefense = (bot as any).__lastDefense || null;
   const lastDeath = (bot as any).__lastDeath || null;
+  const lastHungerWarning = (bot as any).__lastHungerWarning || null;
   const isDrowning = bot.oxygenLevel !== undefined && bot.oxygenLevel < 10;
   const effects = Object.values((bot as any).__effects || {}).map((e: any) => ({ id: e.id, amplifier: e.amplifier, duration: e.duration }));
   const pos = bot.entity?.position;
@@ -223,7 +224,9 @@ function getStatus(bot: Bot) {
   (bot as any).__lastDefense = null;
   // Clear lastDeath after reporting (one-shot)
   (bot as any).__lastDeath = null;
-  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, lastDeath, effects, env };
+  // Clear hunger warning after reporting (one-shot)
+  (bot as any).__lastHungerWarning = null;
+  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, lastDeath, lastHungerWarning, effects, env };
 }
 
 function resolveBlockAliases(name: string, mcData: any): string[] {
@@ -462,9 +465,49 @@ async function joinGame(params: Record<string, unknown>) {
         });
       }
     } catch {}
+
+    // Inherent auto-eat with warnings when hungry and no food
+    try {
+      const hungerThreshold = 15;
+      ;(bot as any).__autoEatCfg = { enabled: true, threshold: hungerThreshold, warnCooldownMs: 30000, lastWarnAt: 0, lastTriedAt: 0, isEating: false };
+      // @ts-ignore
+      if ((bot as any).autoEat) (bot as any).autoEat.options = { priority: "foodPoints", minHunger: hungerThreshold };
+      ;(bot as any).__autoEatInterval = setInterval(async () => {
+        try {
+          if (!(bot as any).__autoEatCfg?.enabled) return;
+          if (!bot.entity) return;
+          if (bot.food >= hungerThreshold) return;
+          const now = Date.now();
+          if ((bot as any).__autoEatCfg.isEating) return;
+          (bot as any).__autoEatCfg.lastTriedAt = now;
+          const hasFood = bot.inventory.items().some((i: any) => isLikelyFood(i.name || ""));
+          if (hasFood) {
+            try {
+              (bot as any).__autoEatCfg.isEating = true;
+              // @ts-ignore
+              await bot.autoEat?.eat?.();
+            } catch (e) {
+              const stillHasFood = bot.inventory.items().some((i: any) => isLikelyFood(i.name || ""));
+              if (!stillHasFood && now - ((bot as any).__autoEatCfg.lastWarnAt || 0) > (bot as any).__autoEatCfg.warnCooldownMs) {
+                (bot as any).__lastHungerWarning = { needed: hungerThreshold, current: bot.food, time: now };
+                (bot as any).__autoEatCfg.lastWarnAt = now;
+              }
+            } finally {
+              (bot as any).__autoEatCfg.isEating = false;
+            }
+          } else {
+            if (now - ((bot as any).__autoEatCfg.lastWarnAt || 0) > (bot as any).__autoEatCfg.warnCooldownMs) {
+              (bot as any).__lastHungerWarning = { needed: hungerThreshold, current: bot.food, time: now };
+              (bot as any).__autoEatCfg.lastWarnAt = now;
+            }
+          }
+        } catch {}
+      }, 2000);
+    } catch {}
   });
 
   bot.on("end", () => {
+    try { clearInterval((bot as any).__autoEatInterval); } catch {}
     if (bots.get(username) === bot) bots.delete(username);
   });
 
