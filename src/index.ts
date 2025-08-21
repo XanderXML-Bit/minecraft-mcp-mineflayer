@@ -33,6 +33,27 @@ const log = (...args: unknown[]) => {
 type BotRegistry = Map<string, Bot>;
 const bots: BotRegistry = new Map();
 
+// Per-bot task mutex and cancellation
+function getTask(bot: Bot) {
+  if (!(bot as any).__task) (bot as any).__task = { running: false, abort: null as null | (() => void) };
+  return (bot as any).__task as { running: boolean; abort: null | (() => void) };
+}
+async function withTask<T>(bot: Bot, fn: (signal: { aborted: boolean; onAbort(cb: () => void): void }) => Promise<T>): Promise<T> {
+  const task = getTask(bot);
+  if (task.running) throw new Error('another_task_running');
+  task.running = true;
+  let aborted = false;
+  const onAbortCbs: Array<() => void> = [];
+  task.abort = () => { aborted = true; for (const cb of onAbortCbs) { try { cb(); } catch {} } };
+  try {
+    const res = await fn({ aborted, onAbort(cb) { onAbortCbs.push(cb); } });
+    return res;
+  } finally {
+    task.running = false;
+    task.abort = null;
+  }
+}
+
 // Prevent process crashes on unexpected async errors
 process.on('unhandledRejection', (err: any) => {
   try { log('unhandledRejection', err); } catch {}
@@ -80,7 +101,7 @@ function hasArrows(bot: Bot): boolean {
 
 async function equipBowIfAvailable(bot: Bot): Promise<boolean> {
   const bow = bot.inventory.items().find(i => i.name === 'bow');
-  if (bow && hasArrows(bot)) { await bot.equip(bow, 'hand'); return true; }
+  if (bow && hasArrows(bot)) { pushSuspendAutoEat(bot); try { await bot.equip(bow, 'hand'); } finally { popSuspendAutoEat(bot); } return true; }
   return false;
 }
 
@@ -110,7 +131,7 @@ async function equipBestToolForBlock(bot: Bot, block: any): Promise<boolean> {
     const shovelTargets = ['dirt','sand','gravel','snow','clay','soul_sand','soul_soil'];
     const hoeTargets = ['leaves','hay','wheat','carrots','potatoes','beetroots'];
     const equipFromList = async (names: string[]) => {
-      for (const nm of names) { const it = bot.inventory.items().find(i => i.name === nm); if (it) { await bot.equip(it, 'hand'); return true; } }
+      for (const nm of names) { const it = bot.inventory.items().find(i => i.name === nm); if (it) { pushSuspendAutoEat(bot); try { await bot.equip(it, 'hand'); } finally { popSuspendAutoEat(bot); } return true; } }
       return false;
     };
     if (pickTargets.some(t => n.includes(t))) return await equipFromList(pick);
@@ -155,6 +176,21 @@ async function digBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) {
     // Ensure we consume any late rejections
     try { (digging as any).catch?.(() => {}); } catch {}
   }
+}
+
+// Suspend auto-eat helper (reference-counted)
+function pushSuspendAutoEat(bot: Bot) {
+  const c = Number((bot as any).__suspendAutoEatCount || 0);
+  (bot as any).__suspendAutoEatCount = c + 1;
+  (bot as any).__suspendAutoEat = true;
+}
+function popSuspendAutoEat(bot: Bot) {
+  try {
+    const c = Number((bot as any).__suspendAutoEatCount || 0);
+    const n = Math.max(0, c - 1);
+    (bot as any).__suspendAutoEatCount = n;
+    (bot as any).__suspendAutoEat = n > 0;
+  } catch {}
 }
 
 function getStatus(bot: Bot) {
@@ -332,7 +368,7 @@ async function raiseShieldFor(bot: Bot, durationMs: number) {
     const off = slots[45];
     if (!off || off.name !== 'shield') {
       const shield = bot.inventory.items().find(i => i.name === 'shield');
-      if (shield) await bot.equip(shield, 'off-hand');
+      if (shield) { pushSuspendAutoEat(bot); try { await bot.equip(shield, 'off-hand'); } finally { popSuspendAutoEat(bot); } }
     }
     // Hold use to raise shield
     // @ts-ignore
@@ -659,6 +695,7 @@ async function stopAllTasks(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   try { (bot as any).pvp?.stop?.(); } catch {}
   try { bot.pathfinder?.stop?.(); } catch {}
+  try { const t = (bot as any).__task; if (t?.abort) t.abort(); } catch {}
   // No direct API to stop statemachine; users should avoid starting it unless needed
   return { ok: true };
 }
@@ -800,6 +837,7 @@ async function hunt(params: Record<string, unknown>) {
 
 async function mineResource(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const blockName = String(params.blockName || params.resource || 'stone');
   const count = Number(params.count ?? 1);
   const maxMs = Number((params as any).maxMs ?? 120000);
@@ -824,13 +862,7 @@ async function mineResource(params: Record<string, unknown>) {
       const navStart = Date.now();
       while (Date.now() - navStart < 20000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
       // @ts-ignore perform collect with timeout
-      try {
-        // Temporarily suspend auto-eat to avoid conflicts during collect/dig
-        (bot as any).__suspendAutoEat = true;
-        await collectBlockWithTimeout(bot, b, 30000);
-      } finally {
-        (bot as any).__suspendAutoEat = false;
-      }
+      try { pushSuspendAutoEat(bot); await collectBlockWithTimeout(bot, b, 30000); } finally { popSuspendAutoEat(bot); }
       completed++;
       lastProgressAt = Date.now();
     } catch (e: any) {
@@ -842,10 +874,12 @@ async function mineResource(params: Record<string, unknown>) {
   const timedOut = Date.now() - start > maxMs;
   const stalled = Date.now() - lastProgressAt > 20000 && !timedOut && completed < count;
   return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, timedOut, stalled };
+  });
 }
 
 async function harvestMatureCrops(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const crops = ['wheat', 'carrots', 'potatoes', 'beetroots'];
   const want = Math.max(1, Number((params as any).count ?? 8));
   // Dynamic scan for candidate crop blocks around bot within radius
@@ -879,7 +913,7 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
       const navStart = Date.now();
       while (Date.now() - navStart < 20000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
       // Prefer direct dig for reliability on crop blocks
-      await bot.dig(b as any);
+      try { pushSuspendAutoEat(bot); await bot.dig(b as any); } finally { popSuspendAutoEat(bot); }
       await bot.waitForTicks(2);
       harvested++;
       lastProgressAt = Date.now();
@@ -892,6 +926,7 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
   }
   const timedOut = Date.now() - start > maxMs;
   return { ok: harvested > 0, requested: want, harvested, remaining: Math.max(0, want - harvested), failed, timedOut };
+  });
 }
 
 async function pickupItem(params: Record<string, unknown>) {
@@ -917,7 +952,8 @@ async function pickupItem(params: Record<string, unknown>) {
 async function openNearbyChest(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
   const pos = await pathfindToPredicate(bot, (b: any) => b?.name?.includes('chest'), 24, 2);
-  const chest = await bot.openChest(pos as any);
+  let chest: any;
+  try { pushSuspendAutoEat(bot); chest = await bot.openChest(pos as any); } finally { popSuspendAutoEat(bot); }
   await bot.waitForTicks(10);
   const items = chest.containerItems().map((i: any) => ({ name: i.name, count: i.count }));
   chest.close();
@@ -926,6 +962,7 @@ async function openNearbyChest(params: Record<string, unknown>) {
 
 async function craftItems(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const itemName = String(params.itemName || params.name || 'stick');
   const count = Number(params.count ?? 1);
   const mcDataMod = await import('minecraft-data');
@@ -944,7 +981,7 @@ async function craftItems(params: Record<string, unknown>) {
       }
       const ref = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0));
       if (!ref) return { ok: false, requested: count, crafted: 0, remaining: count, usedTable: false, timedOut: false, reason: 'missing_table', errors: ['No support block to place crafting_table'] };
-      await bot.equip(tableItem, 'hand');
+      try { pushSuspendAutoEat(bot); await bot.equip(tableItem, 'hand'); } finally { popSuspendAutoEat(bot); }
       await bot.placeBlock(ref as any, new Vec3(0, 1, 0));
       await bot.waitForTicks(2);
       const pos = bot.entity.position.floored().offset(0, 0, 1);
@@ -1056,7 +1093,7 @@ async function craftItems(params: Record<string, unknown>) {
     try {
       // mineflayer doesn't support AbortSignal; use race
       await Promise.race([
-        bot.craft(recipe, amount, tableBlock || null),
+        (async () => { pushSuspendAutoEat(bot); try { await bot.craft(recipe, amount, tableBlock || null); } finally { popSuspendAutoEat(bot); } })(),
         new Promise((_, rej) => setTimeout(() => rej(new Error('craft_timeout')), timeoutMs))
       ]);
     } finally {
@@ -1103,6 +1140,7 @@ async function craftItems(params: Record<string, unknown>) {
   // Always compute missing for visibility if we didn't craft everything
   const missingItems = crafted < count ? computeMissingFor(Math.max(1, count - crafted)) : [];
   return { ok: crafted > 0, requested: count, crafted, remaining: Math.max(0, count - crafted), usedTable: !!tableBlock, timedOut, reason, missingItems, errors };
+  });
 }
 
 // List recipes for a specific item and whether they are currently craftable
@@ -1258,7 +1296,8 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
     if (!furnace.fuelItem()) {
       const fuel = findFuel();
       if (fuel) {
-        await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count));
+        pushSuspendAutoEat(bot);
+        try { await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count)); } finally { popSuspendAutoEat(bot); }
       } else {
         // Start without fuel: report immediately
         return { ok: false, deviceUsed: device, outputsCollected: 0, requested: count, remaining: count, outOfFuel: true, reason: 'missing_fuel' };
@@ -1270,7 +1309,8 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
       const nxt = bot.inventory.items().find(i => i.name === itemName && i.count > 0);
       if (!nxt) break;
       const batch = Math.min(nxt.count, toProcess - inserted);
-      await furnace.putInput(nxt.type, null, batch);
+      pushSuspendAutoEat(bot);
+      try { await furnace.putInput(nxt.type, null, batch); } finally { popSuspendAutoEat(bot); }
       inserted += batch;
     }
     // Collect outputs until done or timeout
@@ -1298,7 +1338,8 @@ async function cookOrSmeltOnDevice(bot: Bot, device: 'furnace'|'smoker'|'blast_f
           const fuel = findFuel();
           if (fuel && refuelAttempts < 2) {
             try {
-              await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count));
+              pushSuspendAutoEat(bot);
+              try { await furnace.putFuel(fuel.type, null, Math.min(1, fuel.count)); } finally { popSuspendAutoEat(bot); }
               refuelAttempts++;
               lastProgressAt = Date.now();
               continue;
@@ -1324,7 +1365,7 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
   if (!campfirePos) throw new Error('No campfire nearby');
   const food = bot.inventory.items().find(i => i.name === itemName);
   if (!food) throw new Error(`Missing input '${itemName}'`);
-  await bot.equip(food, 'hand');
+  try { pushSuspendAutoEat(bot); await bot.equip(food, 'hand'); } finally { popSuspendAutoEat(bot); }
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
   const cp: any = (campfirePos as any).position || campfirePos;
@@ -1333,7 +1374,7 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
   const block = bot.blockAt(campfirePos as any);
   if (!block) throw new Error('Campfire vanished');
   // Place items and wait
-  await bot.activateBlock(block as any);
+  try { pushSuspendAutoEat(bot); await bot.activateBlock(block as any); } finally { popSuspendAutoEat(bot); }
   const start = Date.now();
   const maxMs = 45000;
   while (Date.now() - start < maxMs) await bot.waitForTicks(10);
@@ -1354,6 +1395,7 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
 
 async function smeltItem(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const itemName = String(params.itemName || 'iron_ore');
   const preferDevice = params.preferDevice ? String(params.preferDevice) : undefined;
   const fuelName = params.fuelName ? String(params.fuelName) : undefined;
@@ -1396,6 +1438,7 @@ async function smeltItem(params: Record<string, unknown>) {
     }
   }
   return { ok: false, error: 'no_device_available', attemptedDevices: attempts, errors };
+  });
 }
 
 async function cookItem(params: Record<string, unknown>) {
@@ -1471,7 +1514,7 @@ async function placeItemNearYou(params: Record<string, unknown>) {
   const itemName = String(params.itemName || params.name || 'cobblestone');
   const item = bot.inventory.items().find(i => i.name === itemName);
   if (!item) throw new Error('Item not in inventory');
-  await bot.equip(item, 'hand');
+  try { pushSuspendAutoEat(bot); await bot.equip(item, 'hand'); } finally { popSuspendAutoEat(bot); }
 
   // Find nearest empty target cell adjacent to a solid face
   const origin = bot.entity.position.floored();
@@ -1528,7 +1571,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
   const requireWater = Boolean((params as any).requireWater ?? true);
   const hydrationRadius = 4; // Minecraft hydration: up to 4 blocks horizontally (diagonal included)
   const origin = bot.entity.position.floored();
-  await bot.equip(hoe, 'hand');
+  try { pushSuspendAutoEat(bot); await bot.equip(hoe, 'hand'); } finally { popSuspendAutoEat(bot); }
   let tilled = 0; const attempts: Array<{x:number,y:number,z:number, ok:boolean}> = [];
   let sawCandidate = false;
   let sawCandidateWithinWater = false;
@@ -1576,7 +1619,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
           const navStart = Date.now();
           while (Date.now() - navStart < 15000) { if (bot.entity.position.distanceTo(pos) <= 4.2) break; await bot.waitForTicks(5); }
         }
-        await bot.activateBlock(b as any);
+        try { pushSuspendAutoEat(bot); await bot.activateBlock(b as any); } finally { popSuspendAutoEat(bot); }
         await bot.waitForTicks(3);
         const after = bot.blockAt(pos);
         const ok = !!after && after.name === 'farmland';
@@ -1650,6 +1693,7 @@ async function dance(params: Record<string, unknown>) {
 
 async function buildSomething(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const mode = String((params as any).mode ?? 'commands'); // 'commands' | 'survival'
   if (mode === 'commands') {
     const cmds = (params as any).commands as string[] | undefined;
@@ -1671,66 +1715,76 @@ async function buildSomething(params: Record<string, unknown>) {
   if (!item) throw new Error('Item not in inventory');
   const support = bot.blockAt(new Vec3(x, y - 1, z));
   if (!support) throw new Error('No support block below target');
-  await bot.equip(item, 'hand');
+  try { pushSuspendAutoEat(bot); await bot.equip(item, 'hand'); } finally { popSuspendAutoEat(bot); }
   // Navigate close
   const movements = new Movements(bot);
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, 2));
   const begin = Date.now();
   while (Date.now() - begin < 20000) { if (bot.entity.position.distanceTo(new Vec3(x,y,z)) <= 4.5) break; await bot.waitForTicks(5); }
-  await bot.placeBlock(support as any, new Vec3(0, 1, 0));
+  try { pushSuspendAutoEat(bot); await bot.placeBlock(support as any, new Vec3(0, 1, 0)); } finally { popSuspendAutoEat(bot); }
   return { ok: true, mode };
+  });
 }
 
 async function depositItemsToNearbyChest(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const itemName = String(params.itemName || params.name || '');
   const count = params.count != null ? Number(params.count) : null;
   if (!itemName) throw new Error('itemName required');
   const chestPos = await pathfindToPredicate(bot, (b: any) => b?.name?.includes('chest'), 24, 2);
-  const chest = await bot.openChest(chestPos as any);
+  let chest: any;
+  try { pushSuspendAutoEat(bot); chest = await bot.openChest(chestPos as any); } finally { popSuspendAutoEat(bot); }
   try {
     const item = bot.inventory.items().find(i => i.name === itemName);
     if (!item) throw new Error('Item not in inventory');
-    await chest.deposit(item.type, null, count ?? item.count);
+    try { pushSuspendAutoEat(bot); await chest.deposit(item.type, null, count ?? item.count); } finally { popSuspendAutoEat(bot); }
     const items = chest.containerItems().map((i: any) => ({ name: i.name, count: i.count }));
     return { ok: true, chestItems: items };
   } finally {
     chest.close();
   }
+  });
 }
 
 async function withdrawItemsFromNearbyChest(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const itemName = String(params.itemName || params.name || '');
   const count = params.count != null ? Number(params.count) : null;
   if (!itemName) throw new Error('itemName required');
   const chestPos = await pathfindToPredicate(bot, (b: any) => b?.name?.includes('chest'), 24, 2);
-  const chest = await bot.openChest(chestPos as any);
+  let chest: any;
+  try { pushSuspendAutoEat(bot); chest = await bot.openChest(chestPos as any); } finally { popSuspendAutoEat(bot); }
   try {
     const mcDataMod = await import('minecraft-data');
     const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
     const item = mcData.itemsByName[itemName];
     if (!item) throw new Error(`Unknown item ${itemName}`);
-    await chest.withdraw(item.id, null, count ?? 1);
+    try { pushSuspendAutoEat(bot); await chest.withdraw(item.id, null, count ?? 1); } finally { popSuspendAutoEat(bot); }
     const items = chest.containerItems().map((i: any) => ({ name: i.name, count: i.count }));
     return { ok: true, chestItems: items };
   } finally {
     chest.close();
   }
+  });
 }
 
 async function digBlock(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const x = Number(params.x), y = Number(params.y), z = Number(params.z);
   const block = bot.blockAt(new Vec3(x, y, z));
   if (!block) throw new Error('Block not found');
-  await bot.dig(block as any);
+  try { pushSuspendAutoEat(bot); await bot.dig(block as any); } finally { popSuspendAutoEat(bot); }
   return { ok: true };
+  });
 }
 
 async function placeBlockAt(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const x = Number(params.x), y = Number(params.y), z = Number(params.z);
   const itemName = String(params.itemName || params.name || '');
   if (!itemName) throw new Error('itemName required');
@@ -1738,7 +1792,7 @@ async function placeBlockAt(params: Record<string, unknown>) {
   if (!item) throw new Error('Item not in inventory');
   const below = bot.blockAt(new Vec3(x, y - 1, z));
   if (!below) throw new Error('No support block below target');
-  await bot.equip(item, 'hand');
+  try { pushSuspendAutoEat(bot); await bot.equip(item, 'hand'); } finally { popSuspendAutoEat(bot); }
   // Move into range if needed
   const targetVec = new Vec3(x, y, z);
   if (bot.entity.position.distanceTo(targetVec) > 4.5) {
@@ -1748,8 +1802,9 @@ async function placeBlockAt(params: Record<string, unknown>) {
     const start = Date.now();
     while (Date.now() - start < 20000) { if (bot.entity.position.distanceTo(targetVec) <= 4.5) break; await bot.waitForTicks(5); }
   }
-  await bot.placeBlock(below as any, new Vec3(0, 1, 0));
+  try { pushSuspendAutoEat(bot); await bot.placeBlock(below as any, new Vec3(0, 1, 0)); } finally { popSuspendAutoEat(bot); }
   return { ok: true };
+  });
 }
 
 async function listInventory(params: Record<string, unknown>) {
@@ -1881,11 +1936,12 @@ async function scanArea(params: Record<string, unknown>) {
 // Plant seeds within radius
 async function plantSeedsWithinRadius(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
+  return withTask(bot, async (_signal) => {
   const seedName = String((params as any).seedName ?? 'wheat_seeds');
   const radius = Number((params as any).radius ?? 3);
   const seed = bot.inventory.items().find(i => i.name === seedName);
   if (!seed) throw new Error('Seeds not in inventory');
-  await bot.equip(seed, 'hand');
+  try { pushSuspendAutoEat(bot); await bot.equip(seed, 'hand'); } finally { popSuspendAutoEat(bot); }
   const origin = bot.entity.position.floored();
   let planted = 0; const failed: Array<{x:number,y:number,z:number, reason?: string}> = [];
   for (let dx = -radius; dx <= radius; dx++) {
@@ -1915,7 +1971,7 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
           while (Date.now() - navStart < 15000) { if (bot.entity.position.distanceTo(pos) <= 4.5) break; await bot.waitForTicks(5); }
         }
         // Use item on farmland to plant (some servers require right-click with seed)
-        await bot.activateBlock(farmland as any);
+        try { pushSuspendAutoEat(bot); await bot.activateBlock(farmland as any); } finally { popSuspendAutoEat(bot); }
         planted++;
         await bot.waitForTicks(3);
         // Verify a crop appeared
@@ -1929,6 +1985,7 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
     }
   }
   return { ok: planted > 0, planted, failed };
+  });
 }
 
 async function stopAttack(params: Record<string, unknown>) {
@@ -2021,7 +2078,7 @@ async function equipItem(params: Record<string, unknown>) {
   const destination = String((params as any).destination || 'hand');
   const item = bot.inventory.items().find(i => i.name === itemName);
   if (!item) throw new Error(`Item '${itemName}' not found in inventory`);
-  await bot.equip(item, destination as any);
+  try { pushSuspendAutoEat(bot); await bot.equip(item, destination as any); } finally { popSuspendAutoEat(bot); }
   let durability: any = null;
   try {
     let mcData = (bot as any).__mcdata;
@@ -2114,7 +2171,7 @@ async function gatherSeeds(params: Record<string, unknown>) {
       bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
       const navStart = Date.now();
       while (Date.now() - navStart < 15000) { const d = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z)); if (d <= 2.5) break; await bot.waitForTicks(5); }
-      await bot.dig(b as any);
+      try { pushSuspendAutoEat(bot); await bot.dig(b as any); } finally { popSuspendAutoEat(bot); }
       broken++;
       await bot.waitForTicks(2);
       const seedsNow = countSeeds();
