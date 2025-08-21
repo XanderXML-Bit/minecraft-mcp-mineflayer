@@ -997,7 +997,8 @@ async function mineResource(params: Record<string, unknown>) {
   // Pre-check required tool category
   const needCat = requiredToolCategoryForBlockName(blocks[0]?.name || blockName);
   if (needCat && !inventoryHasToolCategory(bot, needCat)) {
-    return { ok: false, requested: count, completed: 0, remaining: count, reason: 'missing_tool', needed: needCat };
+    const err = needCat === 'pickaxe' ? 'no_pickaxe' : 'no_tools';
+    return { ok: false, requested: count, completed: 0, remaining: count, error: err, reason: 'missing_tool', needed: needCat };
   }
   let completed = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
   const start = Date.now();
@@ -1010,8 +1011,9 @@ async function mineResource(params: Record<string, unknown>) {
       // Per-block tool check to avoid timeouts on unmineable blocks
       const need = requiredToolCategoryForBlockName((b as any).name || '');
       if (need && !inventoryHasToolCategory(bot, need)) {
-        failed.push({ x: p.x, y: p.y, z: p.z, error: `missing_tool:${need}` });
-        continue;
+        const err = need === 'pickaxe' ? 'no_pickaxe' : 'no_tools';
+        failed.push({ x: p.x, y: p.y, z: p.z, error: err });
+        return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, error: err, reason: 'missing_tool', needed: need };
       }
       await equipBestToolForBlock(bot, b);
       const movements = configureMovementsDefaults(new Movements(bot));
@@ -1048,7 +1050,11 @@ async function mineResource(params: Record<string, unknown>) {
             // Mine neighbor
             try {
               const need = requiredToolCategoryForBlockName(nb.name || '');
-              if (need && !inventoryHasToolCategory(bot, need)) { failed.push({ x: np.x, y: np.y, z: np.z, error: `missing_tool:${need}` }); continue; }
+              if (need && !inventoryHasToolCategory(bot, need)) { 
+                const err = need === 'pickaxe' ? 'no_pickaxe' : 'no_tools';
+                failed.push({ x: np.x, y: np.y, z: np.z, error: err }); 
+                return { ok: completed > 0, requested: count, completed, remaining: Math.max(0, count - completed), failed, error: err, reason: 'missing_tool', needed: need };
+              }
               await equipBestToolForBlock(bot, nb);
               const movements2 = configureMovementsDefaults(new Movements(bot));
               bot.pathfinder.setMovements(movements2);
