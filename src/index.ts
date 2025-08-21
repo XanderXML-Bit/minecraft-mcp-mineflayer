@@ -553,10 +553,36 @@ async function joinGame(params: Record<string, unknown>) {
         } catch {}
       }, 2000);
     } catch {}
+
+    // Projectile-aware auto-shield: briefly raise shield when projectiles are nearby
+    try {
+      ;(bot as any).__shieldScan = setInterval(() => {
+        try {
+          const as = (bot as any).__autoShield;
+          if (!as?.enabled) return;
+          const now = Date.now();
+          const last = (bot as any).__shieldLastRaised || 0;
+          if (now - last < 600) return;
+          const near = Object.values(bot.entities).some((e: any) => {
+            if (!e || !e.position) return false;
+            const n = String(e.name || e.displayName || '').toLowerCase();
+            // Common projectile names across versions
+            const isProj = n.includes('arrow') || n.includes('trident') || n.includes('snowball') || n.includes('fireball') || n.includes('projectile');
+            if (!isProj) return false;
+            return e.position.distanceTo(bot.entity.position) <= 6;
+          });
+          if (near) {
+            (bot as any).__shieldLastRaised = now;
+            raiseShieldFor(bot, Number(as.durationMs ?? 800)).catch(() => {});
+          }
+        } catch {}
+      }, 400);
+    } catch {}
   });
 
   bot.on("end", () => {
     try { clearInterval((bot as any).__autoEatInterval); } catch {}
+    try { clearInterval((bot as any).__shieldScan); } catch {}
     if (bots.get(username) === bot) bots.delete(username);
   });
 
