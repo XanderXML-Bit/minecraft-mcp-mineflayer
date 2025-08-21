@@ -38,17 +38,28 @@ function getTask(bot: Bot) {
   if (!(bot as any).__task) (bot as any).__task = { running: false, abort: null as null | (() => void) };
   return (bot as any).__task as { running: boolean; abort: null | (() => void) };
 }
-async function withTask<T>(bot: Bot, fn: (signal: { aborted: boolean; onAbort(cb: () => void): void }) => Promise<T>): Promise<T> {
+async function withTask<T>(bot: Bot, fn: (signal: { onAbort(cb: () => void): void }) => Promise<T>): Promise<T> {
   const task = getTask(bot);
   if (task.running) throw new Error('another_task_running');
   task.running = true;
-  let aborted = false;
   const onAbortCbs: Array<() => void> = [];
-  task.abort = () => { aborted = true; for (const cb of onAbortCbs) { try { cb(); } catch {} } };
+  task.abort = () => { try { bot.pathfinder?.stop?.(); (bot as any).pvp?.stop?.(); } catch {} for (const cb of onAbortCbs) { try { cb(); } catch {} } };
+  let deathListener: any = null;
   try {
-    const res = await fn({ aborted, onAbort(cb) { onAbortCbs.push(cb); } });
-    return res;
+    const deathPromise = new Promise<never>((_, rej) => {
+      deathListener = () => {
+        try { bot.pathfinder?.stop?.(); (bot as any).pvp?.stop?.(); } catch {}
+        rej(new Error('bot_died'));
+      };
+      try { bot.on('death', deathListener); } catch {}
+    });
+    const run = fn({ onAbort(cb) { onAbortCbs.push(cb); } });
+    const res = await Promise.race([run, deathPromise]);
+    return res as T;
   } finally {
+    if (deathListener) {
+      try { bot.removeListener('death', deathListener); } catch {}
+    }
     task.running = false;
     task.abort = null;
   }
@@ -113,7 +124,7 @@ async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, max
     const dist = bot.entity.position.distanceTo(new Vec3(p.x, p.y, p.z));
     if (dist <= Math.max(1, range) + 0.5) break;
     if (dist + 0.25 < best) { best = dist; lastProgressAt = Date.now(); }
-    if (Date.now() - lastProgressAt > idleMs) throw new Error('navigation_stalled');
+    if (Date.now() - lastProgressAt > idleMs) { await attemptUnstuck(bot); best = Infinity; lastProgressAt = Date.now(); }
     await bot.waitForTicks(5);
   }
   if (Date.now() - start >= timeoutMs) throw new Error('navigation_timeout');
@@ -263,6 +274,33 @@ function popSuspendAutoEat(bot: Bot) {
     const n = Math.max(0, c - 1);
     (bot as any).__suspendAutoEatCount = n;
     (bot as any).__suspendAutoEat = n > 0;
+  } catch {}
+}
+
+// Try to recover if pathfinding is stuck
+async function attemptUnstuck(bot: Bot) {
+  try { bot.pathfinder.stop(); } catch {}
+  try {
+    // Small random nudge
+    const dirs: Array<keyof Bot['controlState']> = ['left','right','back','forward'];
+    const pick = dirs[Math.floor(Math.random() * dirs.length)] as any;
+    bot.setControlState(pick, true);
+    await bot.waitForTicks(10);
+    bot.setControlState(pick, false);
+  } catch {}
+  try {
+    // Jump to escape small holes
+    bot.setControlState('jump' as any, true);
+    await bot.waitForTicks(6);
+    bot.setControlState('jump' as any, false);
+  } catch {}
+  try {
+    // Clear head obstruction if any
+    const head = bot.entity.position.floored().offset(0, 1, 0);
+    const block = bot.blockAt(head);
+    if (block && block.boundingBox !== 'empty' && !(block as any).liquid) {
+      await digBlockWithTimeout(bot, block as any, 6000);
+    }
   } catch {}
 }
 
@@ -598,7 +636,8 @@ async function joinGame(params: Record<string, unknown>) {
           if (!(bot as any).__autoEatCfg?.enabled) return;
           if (!bot.entity) return;
           if (bot.food >= hungerThreshold) return;
-          if ((bot as any).__suspendAutoEat) return;
+          // Defense takes priority over eating; otherwise allow auto-eat even during tasks
+          if (isDefenseActive(bot)) return;
           const now = Date.now();
           if ((bot as any).__autoEatCfg.isEating) return;
           (bot as any).__autoEatCfg.lastTriedAt = now;
@@ -750,7 +789,11 @@ async function goToKnownLocation(params: Record<string, unknown>) {
     const d = bot.entity.position.distanceTo(target);
     if (d <= Math.max(1, range) + 0.5) { arrived = true; break; }
     if (d + 0.25 < best) { best = d; lastProgressAt = Date.now(); }
-    if (!isDefenseActive(bot) && Date.now() - lastProgressAt > 15000) break; // stalled unless defending
+    if (!isDefenseActive(bot) && Date.now() - lastProgressAt > 15000) {
+      await attemptUnstuck(bot);
+      best = Infinity;
+      lastProgressAt = Date.now();
+    }
     await bot.waitForTicks(5);
   }
   try { bot.pathfinder.stop(); } catch {}
@@ -1172,6 +1215,25 @@ async function pickupItem(params: Record<string, unknown>) {
   }
   const timedOut = Date.now() - start >= maxMs;
   return { ok: pickedUp, pickedUp, timedOut };
+}
+
+// Pick up all loot within radius
+async function pickupLootWithinRadius(params: Record<string, unknown>) {
+  const bot = getBotOrThrow(String(params.username || ""));
+  const radius = Math.max(1, Math.min(20, Number((params as any).radius ?? 8)));
+  const start = Date.now();
+  const maxMs = Number((params as any).maxMs ?? 60000);
+  let count = 0;
+  const movements = configureMovementsDefaults(new Movements(bot));
+  bot.pathfinder.setMovements(movements);
+  while (Date.now() - start < maxMs) {
+    const item = bot.nearestEntity((e: any) => e.type === 'object' && e.position && e.position.distanceTo(bot.entity.position) <= radius);
+    if (!item) break;
+    bot.pathfinder.setGoal(new goals.GoalFollow(item, 1));
+    await bot.waitForTicks(20);
+    count++;
+  }
+  return { ok: true, pickedUp: count };
 }
 
 async function openNearbyChest(params: Record<string, unknown>) {
@@ -2046,33 +2108,31 @@ async function detectGamemode(params: Record<string, unknown>) {
 
 async function goToSurface(params: Record<string, unknown>) {
   const bot = getBotOrThrow(String(params.username || ""));
-  // Move up until we find sky exposure or y increases to a safe threshold
-  const start = bot.entity.position.floored();
-  let target: Vec3 | null = null;
-  for (let dy = 0; dy < 64; dy++) {
-    const y = start.y + dy;
-    const head = new Vec3(start.x, y + 1, start.z);
-    let clearAbove = true;
-    for (let ay = 0; ay < 20; ay++) {
-      const b = bot.blockAt(head.offset(0, ay, 0));
-      if (b && b.boundingBox !== 'empty') { clearAbove = false; break; }
-    }
-    if (clearAbove) { target = new Vec3(start.x, y, start.z); break; }
-  }
-  if (!target) throw new Error('No clear surface found above');
-  const movements = configureMovementsDefaults(new Movements(bot));
-  bot.pathfinder.setMovements(movements);
-  bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
-  // Wait until at surface: close to target and clear to sky at current pos
-  const begin = Date.now();
-  const maxMs = Number((params as any).maxMs ?? 90000);
+  // Keep moving upward; dig if blocked, until clear to sky
+  const maxMs = Number((params as any).maxMs ?? 120000);
+  const startAt = Date.now();
   let arrived = false;
-  while (Date.now() - begin < maxMs || isDefenseActive(bot)) {
-    const d = bot.entity.position.distanceTo(target);
-    const near = d <= 3;
-    const clear = isClearToSkyAt(bot, bot.entity.position.floored());
-    if (near && clear) { arrived = true; break; }
-    await bot.waitForTicks(5);
+  while (Date.now() - startAt < maxMs || isDefenseActive(bot)) {
+    const here = bot.entity.position.floored();
+    if (isClearToSkyAt(bot, here)) { arrived = true; break; }
+    // Try stepping up one block or dig above
+    const above = bot.blockAt(here.offset(0, 1, 0));
+    const twoAbove = bot.blockAt(here.offset(0, 2, 0));
+    if (above && above.boundingBox !== 'empty') {
+      try { pushSuspendAutoEat(bot); await digBlockWithTimeout(bot, above as any, 15000); } finally { popSuspendAutoEat(bot); }
+      await bot.waitForTicks(2);
+      continue;
+    }
+    if (twoAbove && twoAbove.boundingBox !== 'empty') {
+      try { pushSuspendAutoEat(bot); await digBlockWithTimeout(bot, twoAbove as any, 15000); } finally { popSuspendAutoEat(bot); }
+      await bot.waitForTicks(2);
+      continue;
+    }
+    // Move upward toward daylight by small hops
+    const movements = configureMovementsDefaults(new Movements(bot));
+    bot.pathfinder.setMovements(movements);
+    bot.pathfinder.setGoal(new goals.GoalNear(here.x, here.y + 2, here.z, 1));
+    await bot.waitForTicks(10);
   }
   return { ok: arrived, arrived };
 }
@@ -2452,6 +2512,7 @@ async function sendToolCall(req: any): Promise<{ content: Array<{ type: "text"; 
       case "mineResource": action = await mineResource(args); break;
       case "harvestMatureCrops": action = await harvestMatureCrops(args); break;
       case "pickupItem": action = await pickupItem(args); break;
+      case "pickupLootWithinRadius": action = await pickupLootWithinRadius(args); break;
       case "craftItems": action = await craftItems(args); break;
       case "listRecipes": action = await listRecipes(args); break;
       case "listAllRecipes": action = await listAllRecipes(args); break;
@@ -2534,6 +2595,7 @@ function listTools() {
     ,{ name: "mineResource", description: "Mine specific blocks or resources", inputSchema: { type: "object", properties: { username: { type: "string" }, blockName: { type: "string" }, count: { type: "number" } }, required: ["blockName"] } }
     ,{ name: "harvestMatureCrops", description: "Harvest mature crops from farmland with progress timeouts", inputSchema: { type: "object", properties: { username: { type: "string" }, count: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "pickupItem", description: "Pick up items from the ground", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } } } }
+    ,{ name: "pickupLootWithinRadius", description: "Pick up all dropped items within a radius", inputSchema: { type: "object", properties: { username: { type: "string" }, radius: { type: "number" }, maxMs: { type: "number" } } } }
     ,{ name: "craftItems", description: "Craft items using a crafting table", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" }, count: { type: "number" } }, required: ["itemName"] } }
     ,{ name: "listRecipes", description: "List recipes for an item and how many are craftable with current inventory", inputSchema: { type: "object", properties: { username: { type: "string" }, itemName: { type: "string" } }, required: ["itemName"] } }
     ,{ name: "listAllRecipes", description: "List many recipes across items; filter by search, requiresTable, craftableOnly, limit", inputSchema: { type: "object", properties: { username: { type: "string" }, search: { type: "string" }, requiresTable: { type: "boolean" }, craftableOnly: { type: "boolean" }, limit: { type: "number" } } } }
