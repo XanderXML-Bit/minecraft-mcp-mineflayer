@@ -154,6 +154,30 @@ async function equipBestToolForBlock(bot: Bot, block: any): Promise<boolean> {
   return false;
 }
 
+function requiredToolCategoryForBlockName(name: string): 'pickaxe'|'axe'|'shovel'|'hoe'|null {
+  const n = name.toLowerCase();
+  const pickTargets = ['ore','stone','deepslate','cobblestone','obsidian','netherrack','end_stone','andesite','granite','diorite'];
+  const axeTargets = ['log','planks','wood','stem','hyphae'];
+  const shovelTargets = ['dirt','sand','gravel','snow','clay','soul_sand','soul_soil'];
+  const hoeTargets = ['leaves','hay','wheat','carrots','potatoes','beetroots'];
+  if (pickTargets.some(t => n.includes(t))) return 'pickaxe';
+  if (axeTargets.some(t => n.includes(t))) return 'axe';
+  if (shovelTargets.some(t => n.includes(t))) return 'shovel';
+  if (hoeTargets.some(t => n.includes(t))) return 'hoe';
+  return null;
+}
+
+function inventoryHasToolCategory(bot: Bot, category: 'pickaxe'|'axe'|'shovel'|'hoe'): boolean {
+  const tools: Record<'pickaxe'|'axe'|'shovel'|'hoe', string[]> = {
+    pickaxe: ['netherite_pickaxe','diamond_pickaxe','iron_pickaxe','stone_pickaxe','golden_pickaxe','wooden_pickaxe'],
+    axe: ['netherite_axe','diamond_axe','iron_axe','stone_axe','golden_axe','wooden_axe'],
+    shovel: ['netherite_shovel','diamond_shovel','iron_shovel','stone_shovel','golden_shovel','wooden_shovel'],
+    hoe: ['netherite_hoe','diamond_hoe','iron_hoe','stone_hoe','golden_hoe','wooden_hoe']
+  };
+  const list = tools[category] as string[];
+  return bot.inventory.items().some(i => list.includes(i.name));
+}
+
 // CollectBlock with timeout and safe cancellation (avoid unhandled rejections)
 async function collectBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) {
   const rawTask: Promise<any> = (bot as any).collectBlock.collect(block);
@@ -885,6 +909,11 @@ async function mineResource(params: Record<string, unknown>) {
   const positions = bot.findBlocks({ matching: (b: any) => b && candidates.includes(b.name), maxDistance: 64, count });
   if (!positions.length) throw new Error(`No ${blockName} nearby`);
   const blocks = positions.map((v: any) => bot.blockAt(v)).filter(Boolean) as any[];
+  // Pre-check required tool category
+  const needCat = requiredToolCategoryForBlockName(blocks[0]?.name || blockName);
+  if (needCat && !inventoryHasToolCategory(bot, needCat)) {
+    return { ok: false, requested: count, completed: 0, remaining: count, reason: 'missing_tool', needed: needCat };
+  }
   let completed = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
   const start = Date.now();
   let lastProgressAt = start;
@@ -893,6 +922,12 @@ async function mineResource(params: Record<string, unknown>) {
     try {
       // Navigate near the block first to reduce path issues
       const p: any = (b as any).position || b;
+      // Per-block tool check to avoid timeouts on unmineable blocks
+      const need = requiredToolCategoryForBlockName((b as any).name || '');
+      if (need && !inventoryHasToolCategory(bot, need)) {
+        failed.push({ x: p.x, y: p.y, z: p.z, error: `missing_tool:${need}` });
+        continue;
+      }
       await equipBestToolForBlock(bot, b);
       const movements = configureMovementsDefaults(new Movements(bot));
       bot.pathfinder.setMovements(movements);
