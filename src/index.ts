@@ -66,6 +66,16 @@ function configureMovementsDefaults(movements: any) {
   return movements;
 }
 
+// Hostile detection helper
+function isHostileEntityName(name: string): boolean {
+  const n = String(name || '').toLowerCase();
+  const hostile = [
+    'zombie','skeleton','creeper','spider','witch','drowned','husk','stray','pillager','vindicator','ravager',
+    'guardian','elder_guardian','phantom','slime','magma_cube','hoglin','zoglin','blaze','ghast','warden','evoker'
+  ];
+  return hostile.some(h => n.includes(h));
+}
+
 // Prevent process crashes on unexpected async errors
 process.on('unhandledRejection', (err: any) => {
   try { log('unhandledRejection', err); } catch {}
@@ -177,6 +187,18 @@ function inventoryHasToolCategory(bot: Bot, category: 'pickaxe'|'axe'|'shovel'|'
   const list = tools[category] as string[];
   return bot.inventory.items().some(i => list.includes(i.name));
 }
+
+function isOreBlockName(name: string): boolean {
+  const n = String(name || '').toLowerCase();
+  return n.endsWith('_ore') || n.includes('ancient_debris');
+}
+
+function isLogBlockName(name: string): boolean {
+  const n = String(name || '').toLowerCase();
+  return n.endsWith('_log') || n.endsWith('_stem') || n.endsWith('_hyphae');
+}
+
+function posKey(v: Vec3): string { return `${v.x},${v.y},${v.z}`; }
 
 // CollectBlock with timeout and safe cancellation (avoid unhandled rejections)
 async function collectBlockWithTimeout(bot: Bot, block: any, timeoutMs = 30000) {
@@ -602,11 +624,43 @@ async function joinGame(params: Record<string, unknown>) {
         } catch {}
       }, 400);
     } catch {}
+
+    // Proactive self-defense: attack hostile mobs within 5 blocks
+    try {
+      ;(bot as any).__proactiveDefense = setInterval(async () => {
+        try {
+          const sd = (bot as any).__selfDefense;
+          if (!sd?.enabled) return;
+          // Avoid interfering when crafting/smelting/mining, etc.
+          if ((bot as any).__task?.running) return;
+          const hostile = Object.values(bot.entities).find((e: any) => {
+            if (!e || !e.position) return false;
+            if (!isHostileEntityName(e.name || e.username || e.displayName)) return false;
+            const d = e.position.distanceTo(bot.entity.position);
+            return d <= 8.0;
+          });
+          if (!hostile) return;
+          // Equip and attack
+          try {
+            const dist = bot.entity.position.distanceTo(hostile.position);
+            if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
+              await equipBestMeleeWeapon(bot);
+            }
+          } catch {}
+          // @ts-ignore
+          bot.pvp.attack(hostile);
+          const sdMs = Number(((bot as any).__selfDefense?.durationMs) ?? 10000);
+          setTimeout(() => { try { (bot as any).pvp?.stop?.(); } catch {} }, sdMs);
+          (bot as any).__lastDefense = { target: hostile?.name || hostile?.username || 'unknown', time: Date.now() };
+        } catch {}
+      }, 600);
+    } catch {}
   });
 
   bot.on("end", () => {
     try { clearInterval((bot as any).__autoEatInterval); } catch {}
     try { clearInterval((bot as any).__shieldScan); } catch {}
+    try { clearInterval((bot as any).__proactiveDefense); } catch {}
     if (bots.get(username) === bot) bots.delete(username);
   });
 
@@ -938,6 +992,49 @@ async function mineResource(params: Record<string, unknown>) {
       try { pushSuspendAutoEat(bot); await collectBlockWithTimeout(bot, b, 30000); } finally { popSuspendAutoEat(bot); }
       completed++;
       lastProgressAt = Date.now();
+
+      // If this block is an ore or a log, mine the connected cluster (bounded)
+      const minedName = (b as any).name || '';
+      const clusterType = isOreBlockName(minedName) || isLogBlockName(minedName);
+      if (clusterType) {
+        const originPos: Vec3 = (b as any).position || new Vec3(p.x, p.y, p.z);
+        const visited = new Set<string>([posKey(originPos)]);
+        const queue: Vec3[] = [originPos];
+        const maxExtra = 64; // safety bound
+        const dirs = [
+          new Vec3(1,0,0),new Vec3(-1,0,0),new Vec3(0,1,0),new Vec3(0,-1,0),new Vec3(0,0,1),new Vec3(0,0,-1)
+        ];
+        while (queue.length && visited.size < maxExtra && Date.now() - start < maxMs) {
+          const cur = queue.shift()!;
+          for (const d of dirs) {
+            const np = new Vec3(cur.x + d.x, cur.y + d.y, cur.z + d.z);
+            const k = posKey(np);
+            if (visited.has(k)) continue;
+            const nb = bot.blockAt(np);
+            if (!nb) continue;
+            if (String(nb.name || '').toLowerCase() !== minedName.toLowerCase()) continue;
+            visited.add(k);
+            // Mine neighbor
+            try {
+              const need = requiredToolCategoryForBlockName(nb.name || '');
+              if (need && !inventoryHasToolCategory(bot, need)) { failed.push({ x: np.x, y: np.y, z: np.z, error: `missing_tool:${need}` }); continue; }
+              await equipBestToolForBlock(bot, nb);
+              const movements2 = configureMovementsDefaults(new Movements(bot));
+              bot.pathfinder.setMovements(movements2);
+              bot.pathfinder.setGoal(new goals.GoalNear(np.x, np.y, np.z, 1));
+              const navStart2 = Date.now();
+              while (Date.now() - navStart2 < 15000) { const d2 = bot.entity.position.distanceTo(new Vec3(np.x, np.y, np.z)); if (d2 <= 2.5) break; await bot.waitForTicks(5); }
+              try { pushSuspendAutoEat(bot); await collectBlockWithTimeout(bot, nb, 30000); } finally { popSuspendAutoEat(bot); }
+              completed++;
+              lastProgressAt = Date.now();
+              queue.push(np);
+            } catch (e: any) {
+              failed.push({ x: np.x, y: np.y, z: np.z, error: String(e?.message || e) });
+            }
+          }
+          if (Date.now() - lastProgressAt > 20000) break;
+        }
+      }
     } catch (e: any) {
       const q: any = (b as any).position || b;
       failed.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
@@ -973,11 +1070,10 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
   }
   if (!blocks.length) throw new Error('No mature crops found');
   let harvested = 0; const failed: Array<{x:number,y:number,z:number, error?: string}> = [];
-  const maxMs = Number((params as any).maxMs ?? 120000);
-  const start = Date.now();
-  let lastProgressAt = start;
+  const stallMs = Number((params as any).stallMs ?? 20000);
+  let lastProgressAt = Date.now();
   for (const b of blocks) {
-    if (Date.now() - start > maxMs) break;
+    if (Date.now() - lastProgressAt > stallMs) break;
     try {
       const p: any = (b as any).position || b;
       const movements = configureMovementsDefaults(new Movements(bot));
@@ -990,15 +1086,34 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
       await bot.waitForTicks(2);
       harvested++;
       lastProgressAt = Date.now();
+      // Replant appropriate seed if available and farmland present
+      try {
+        const seedMap: Record<string, string> = { wheat: 'wheat_seeds', carrots: 'carrot', potatoes: 'potato', beetroots: 'beetroot_seeds' };
+        const cropName = (b as any).name;
+        const seedName = seedMap[cropName];
+        if (seedName) {
+          const farmland = bot.blockAt(new Vec3(p.x, p.y - 1, p.z));
+          const seedItem = bot.inventory.items().find(i => i.name === seedName);
+          if (farmland && farmland.name === 'farmland' && seedItem) {
+            try { pushSuspendAutoEat(bot); await bot.equip(seedItem, 'hand'); } finally { popSuspendAutoEat(bot); }
+            try { pushSuspendAutoEat(bot); await bot.activateBlock(farmland as any); } finally { popSuspendAutoEat(bot); }
+            await bot.waitForTicks(3);
+            const replanted = bot.blockAt(new Vec3(p.x, p.y, p.z));
+            if (!replanted || (replanted.name !== 'wheat' && replanted.name !== 'carrots' && replanted.name !== 'potatoes' && replanted.name !== 'beetroots')) {
+              failed.push({ x: p.x, y: p.y, z: p.z, error: 'replant_failed' });
+            }
+          }
+        }
+      } catch {}
       if (harvested >= want) break;
     } catch (e: any) {
       const q: any = (b as any).position || b;
       failed.push({ x: q.x, y: q.y, z: q.z, error: String(e?.message || e) });
     }
-    if (Date.now() - lastProgressAt > 20000) break; // stall protection
+    if (Date.now() - lastProgressAt > stallMs) break; // stall protection based on progress
   }
-  const timedOut = Date.now() - start > maxMs;
-  return { ok: harvested > 0, requested: want, harvested, remaining: Math.max(0, want - harvested), failed, timedOut };
+  const stalled = Date.now() - lastProgressAt > stallMs && harvested < want;
+  return { ok: harvested > 0, requested: want, harvested, remaining: Math.max(0, want - harvested), failed, stalled, timedOut: stalled };
   });
 }
 
@@ -1659,21 +1774,12 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
         if (b.name !== 'dirt' && b.name !== 'grass_block') continue;
         const above = bot.blockAt(pos.offset(0, 1, 0));
         if (!above) continue;
-        // If obstruction (grass/flower), clear it first
-        if (above.boundingBox !== 'empty' && isPlantObstruction(above.name)) {
-          try { await bot.dig(above as any); await bot.waitForTicks(2); } catch {}
-        }
-        const above2 = bot.blockAt(pos.offset(0, 1, 0));
-        if (!above2 || above2.boundingBox !== 'empty') continue;
-        sawCandidate = true;
-        // Optional water proximity requirement (hydration)
+        // Optional water proximity requirement (hydration) - check BEFORE clearing obstructions
         if (requireWater) {
           let waterFound = false;
           for (let rx = -hydrationRadius; rx <= hydrationRadius && !waterFound; rx++) {
             for (let rz = -hydrationRadius; rz <= hydrationRadius && !waterFound; rz++) {
-              // Chebyshev distance <= 4
               if (Math.max(Math.abs(rx), Math.abs(rz)) > hydrationRadius) continue;
-              // Only same Y or one above (vanilla hydration)
               for (let ry = 0; ry <= 1 && !waterFound; ry++) {
                 const wp = pos.offset(rx, ry, rz);
                 const w = bot.blockAt(wp);
@@ -1681,9 +1787,16 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
               }
             }
           }
-          if (waterFound) sawCandidateWithinWater = true;
           if (!waterFound) continue;
+          sawCandidateWithinWater = true;
         }
+        // Now clear obstruction (grass/flower), then verify air above
+        if (above.boundingBox !== 'empty' && isPlantObstruction(above.name)) {
+          try { await bot.dig(above as any); await bot.waitForTicks(2); } catch {}
+        }
+        const above2 = bot.blockAt(pos.offset(0, 1, 0));
+        if (!above2 || above2.boundingBox !== 'empty') continue;
+        sawCandidate = true;
         // Move into range
         if (bot.entity.position.distanceTo(pos) > 4.2) {
           const movements = configureMovementsDefaults(new Movements(bot));
@@ -1702,7 +1815,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
       }
     }
   }
-  if (requireWater && tilled === 0 && sawCandidate && !sawCandidateWithinWater) {
+  if (requireWater && tilled === 0 && (!sawCandidateWithinWater)) {
     return { ok: false, tilled: 0, reason: 'no_water_nearby', hydrationRadius, attempted: attempts };
   }
   return { ok: tilled > 0, tilled, attempted: attempts };
