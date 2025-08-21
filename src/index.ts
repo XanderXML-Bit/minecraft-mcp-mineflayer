@@ -138,9 +138,20 @@ async function equipBestMeleeWeapon(bot: Bot): Promise<boolean> {
   ];
   for (const name of preference) {
     const it = bot.inventory.items().find(i => i.name === name);
-    if (it) { await bot.equip(it, 'hand'); return true; }
+    if (it) { try { pushSuspendAutoEat(bot); await bot.equip(it, 'hand'); } finally { popSuspendAutoEat(bot); } return true; }
   }
   return false;
+}
+
+async function equipBestWeaponForTarget(bot: Bot, entity: any): Promise<void> {
+  try {
+    const rangedMin = 8;
+    const pos = entity?.position || bot.entity.position;
+    const dist = bot.entity.position.distanceTo(pos);
+    if (!(await equipBowIfAvailable(bot)) || dist <= rangedMin) {
+      await equipBestMeleeWeapon(bot);
+    }
+  } catch {}
 }
 
 async function equipBestToolForBlock(bot: Bot, block: any): Promise<boolean> {
@@ -265,6 +276,23 @@ function getStatus(bot: Bot) {
   const effects = Object.values((bot as any).__effects || {}).map((e: any) => ({ id: e.id, amplifier: e.amplifier, duration: e.duration }));
   const pos = bot.entity?.position;
   const posObj = pos ? { x: pos.x, y: pos.y, z: pos.z } : undefined;
+  // Inventory occupancy
+  let inventory: any = undefined;
+  let invFullWarning: any = null;
+  try {
+    const emptySlots: number | undefined = (bot as any).inventory?.emptySlotCount?.();
+    const invStart = (bot as any).inventory?.inventoryStart ?? 9;
+    const invEnd = (bot as any).inventory?.inventoryEnd ?? 44;
+    const usedSlots = bot.inventory.items().filter((i: any) => i.slot >= invStart && i.slot <= invEnd).length;
+    const totalSlots = emptySlots != null ? usedSlots + emptySlots : undefined;
+    const full = emptySlots === 0;
+    inventory = { usedSlots, emptySlots, totalSlots, full };
+    const prevEmpty = (bot as any).__prevEmptySlots;
+    if (typeof prevEmpty === 'number' && emptySlots === 0 && prevEmpty > 0) {
+      invFullWarning = { time: Date.now() };
+    }
+    (bot as any).__prevEmptySlots = emptySlots;
+  } catch {}
   // Time of day
   let timeOfDay: number | undefined;
   let isDay: boolean | undefined;
@@ -324,7 +352,7 @@ function getStatus(bot: Bot) {
   (bot as any).__lastDeath = null;
   // Clear hunger warning after reporting (one-shot)
   (bot as any).__lastHungerWarning = null;
-  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, lastDeath, lastHungerWarning, effects, env };
+  return { health: bot.health, food: bot.food, lastDamage: last, lastBroken, lastDefense, lastDeath, lastHungerWarning, inventory, invFullWarning, effects, env };
 }
 
 function resolveBlockAliases(name: string, mcData: any): string[] {
@@ -490,12 +518,7 @@ async function joinGame(params: Record<string, unknown>) {
       if (sd?.enabled && attacker) {
         try {
           // Retaliate briefly without permanently hijacking state (equip best)
-          (async () => {
-            const dist = bot.entity.position.distanceTo(attacker.position || bot.entity.position);
-            if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
-              await equipBestMeleeWeapon(bot);
-            }
-          })().catch(() => {});
+          (async () => { await equipBestWeaponForTarget(bot, attacker); })().catch(() => {});
           // @ts-ignore
           bot.pvp.attack(attacker);
           const sdMs = Number(((bot as any).__selfDefense?.durationMs) ?? 10000);
@@ -644,13 +667,8 @@ async function joinGame(params: Record<string, unknown>) {
           if (!hostile) return;
           // Mark defense active to let task loops honor it
           (bot as any).__defenseActive = true;
-          // Equip and attack
-          try {
-            const dist = bot.entity.position.distanceTo(hostile.position);
-            if (!(await equipBowIfAvailable(bot)) || dist <= 8) {
-              await equipBestMeleeWeapon(bot);
-            }
-          } catch {}
+          // Equip best weapon for the target
+          await equipBestWeaponForTarget(bot, hostile);
           // @ts-ignore
           bot.pvp.attack(hostile);
           // Keep attacking while hostile remains in radius; no external task timeout advancement
