@@ -54,6 +54,18 @@ async function withTask<T>(bot: Bot, fn: (signal: { aborted: boolean; onAbort(cb
   }
 }
 
+function configureMovementsDefaults(movements: any) {
+  try {
+    movements.allowParkour = false;
+    movements.allowSprinting = true;
+    movements.canDig = true;
+    movements.maxDropDown = Math.min(3, movements.maxDropDown ?? 3);
+    // Prefer dry ground over liquids
+    (movements as any).liquidCost = 25;
+  } catch {}
+  return movements;
+}
+
 // Prevent process crashes on unexpected async errors
 process.on('unhandledRejection', (err: any) => {
   try { log('unhandledRejection', err); } catch {}
@@ -75,7 +87,7 @@ async function pathfindToPredicate(bot: Bot, predicate: (b: any) => boolean, max
   const block = bot.findBlock({ matching: (b: any) => !!b && predicate(b), maxDistance });
   if (!block) throw new Error('Target not found nearby');
   const p: any = (block as any).position || block;
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, range));
   // wait until close enough or timeout
@@ -591,7 +603,7 @@ async function goToKnownLocation(params: Record<string, unknown>) {
   const maxMs = Number((params as any).maxMs ?? 60000);
   const mcDataMod = await import("minecraft-data");
   const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
   const target = new Vec3(x, y, z);
@@ -618,7 +630,7 @@ async function goToSomeone(params: Record<string, unknown>) {
   if (!player) throw new Error(`Player '${targetName}' not found`);
   const mcDataMod = await import("minecraft-data");
   const mcData = (mcDataMod as any).default ? (mcDataMod as any).default(bot.version) : (mcDataMod as any)(bot.version);
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalFollow(player, Number(params.distance ?? 3)));
   return { ok: true };
@@ -734,7 +746,7 @@ async function runAway(params: Record<string, unknown>) {
   const t = threat?.position || p.offset(1, 0, 0);
   const dir = p.minus(t).scaled(1);
   const target = p.plus(dir.scaled(distance));
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z), 2));
   return { ok: true };
@@ -762,7 +774,7 @@ async function swimToLand(params: Record<string, unknown>) {
     }
   }
   if (!found) throw new Error('No nearby land found');
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(found.x, found.y, found.z, 1));
   return { ok: true };
@@ -856,7 +868,7 @@ async function mineResource(params: Record<string, unknown>) {
       // Navigate near the block first to reduce path issues
       const p: any = (b as any).position || b;
       await equipBestToolForBlock(bot, b);
-      const movements = new Movements(bot);
+      const movements = configureMovementsDefaults(new Movements(bot));
       bot.pathfinder.setMovements(movements);
       bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
       const navStart = Date.now();
@@ -907,7 +919,7 @@ async function harvestMatureCrops(params: Record<string, unknown>) {
     if (Date.now() - start > maxMs) break;
     try {
       const p: any = (b as any).position || b;
-      const movements = new Movements(bot);
+      const movements = configureMovementsDefaults(new Movements(bot));
       bot.pathfinder.setMovements(movements);
       bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
       const navStart = Date.now();
@@ -934,7 +946,7 @@ async function pickupItem(params: Record<string, unknown>) {
   const itemName = params.itemName ? String(params.itemName) : undefined;
   const ent = bot.nearestEntity((e: any) => e.type === 'object' && (!itemName || e.displayName === itemName));
   if (!ent) throw new Error('No dropped item found');
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalFollow(ent, 1));
   // wait up to 20 seconds to pick up and report partial
@@ -992,7 +1004,7 @@ async function craftItems(params: Record<string, unknown>) {
   // If using a table, path within 2 blocks so crafting UI opens reliably
   if (tableBlock) {
     const tp: any = (tableBlock as any).position || tableBlock;
-    const movements = new Movements(bot);
+    const movements = configureMovementsDefaults(new Movements(bot));
     bot.pathfinder.setMovements(movements);
     bot.pathfinder.setGoal(new goals.GoalNear(tp.x, tp.y, tp.z, 2));
     const start = Date.now();
@@ -1366,7 +1378,7 @@ async function cookOnCampfire(bot: Bot, itemName: string) {
   const food = bot.inventory.items().find(i => i.name === itemName);
   if (!food) throw new Error(`Missing input '${itemName}'`);
   try { pushSuspendAutoEat(bot); await bot.equip(food, 'hand'); } finally { popSuspendAutoEat(bot); }
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   const cp: any = (campfirePos as any).position || campfirePos;
   bot.pathfinder.setGoal(new goals.GoalNear(cp.x, cp.y, cp.z, 1));
@@ -1482,7 +1494,7 @@ async function returnToLastDeathLocation(params: Record<string, unknown>) {
   const last = (bot as any).__lastDeathPosition;
   if (!last || last.x == null) throw new Error('No last death position recorded');
   const target = new Vec3(Number(last.x), Number(last.y), Number(last.z));
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
   // wait up to 60s to arrive
@@ -1549,7 +1561,7 @@ async function placeItemNearYou(params: Record<string, unknown>) {
 
   // Move into placement range if too far
   if (best.dist > 4.5) {
-    const movements = new Movements(bot);
+    const movements = configureMovementsDefaults(new Movements(bot));
     bot.pathfinder.setMovements(movements);
     bot.pathfinder.setGoal(new goals.GoalNear(best.ref.position.x, best.ref.position.y, best.ref.position.z, 2));
     const start = Date.now();
@@ -1613,7 +1625,7 @@ async function prepareLandForFarming(params: Record<string, unknown>) {
         }
         // Move into range
         if (bot.entity.position.distanceTo(pos) > 4.2) {
-          const movements = new Movements(bot);
+          const movements = configureMovementsDefaults(new Movements(bot));
           bot.pathfinder.setMovements(movements);
           bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 2));
           const navStart = Date.now();
@@ -1717,7 +1729,7 @@ async function buildSomething(params: Record<string, unknown>) {
   if (!support) throw new Error('No support block below target');
   try { pushSuspendAutoEat(bot); await bot.equip(item, 'hand'); } finally { popSuspendAutoEat(bot); }
   // Navigate close
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, 2));
   const begin = Date.now();
@@ -1796,7 +1808,7 @@ async function placeBlockAt(params: Record<string, unknown>) {
   // Move into range if needed
   const targetVec = new Vec3(x, y, z);
   if (bot.entity.position.distanceTo(targetVec) > 4.5) {
-    const movements = new Movements(bot);
+    const movements = configureMovementsDefaults(new Movements(bot));
     bot.pathfinder.setMovements(movements);
     bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, 2));
     const start = Date.now();
@@ -1837,7 +1849,7 @@ async function goToSurface(params: Record<string, unknown>) {
     if (clearAbove) { target = new Vec3(start.x, y, start.z); break; }
   }
   if (!target) throw new Error('No clear surface found above');
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalNear(target.x, target.y, target.z, 2));
   // Wait until at surface: close to target and clear to sky at current pos
@@ -1885,7 +1897,7 @@ async function followPlayer(params: Record<string, unknown>) {
   if (targetName) target = bot.players[targetName]?.entity;
   if (!target) target = bot.nearestEntity((e: any) => e.type === 'player' && e.username !== bot.username);
   if (!target) throw new Error('No player to follow');
-  const movements = new Movements(bot);
+  const movements = configureMovementsDefaults(new Movements(bot));
   bot.pathfinder.setMovements(movements);
   bot.pathfinder.setGoal(new goals.GoalFollow(target, Number(params.distance ?? 2)));
   return { ok: true };
@@ -1964,7 +1976,7 @@ async function plantSeedsWithinRadius(params: Record<string, unknown>) {
       try {
         // Ensure range
         if (bot.entity.position.distanceTo(pos) > 4.5) {
-          const movements = new Movements(bot);
+          const movements = configureMovementsDefaults(new Movements(bot));
           bot.pathfinder.setMovements(movements);
           bot.pathfinder.setGoal(new goals.GoalNear(pos.x, pos.y, pos.z, 2));
           const navStart = Date.now();
@@ -2166,7 +2178,7 @@ async function gatherSeeds(params: Record<string, unknown>) {
     try {
       // Move close
       const p: any = (b as any).position || b;
-      const movements = new Movements(bot);
+      const movements = configureMovementsDefaults(new Movements(bot));
       bot.pathfinder.setMovements(movements);
       bot.pathfinder.setGoal(new goals.GoalNear(p.x, p.y, p.z, 1));
       const navStart = Date.now();
