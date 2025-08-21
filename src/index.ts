@@ -66,6 +66,10 @@ function configureMovementsDefaults(movements: any) {
   return movements;
 }
 
+function isDefenseActive(bot: Bot): boolean {
+  return Boolean((bot as any).__defenseActive);
+}
+
 // Hostile detection helper
 function isHostileEntityName(name: string): boolean {
   const n = String(name || '').toLowerCase();
@@ -631,8 +635,6 @@ async function joinGame(params: Record<string, unknown>) {
         try {
           const sd = (bot as any).__selfDefense;
           if (!sd?.enabled) return;
-          // Avoid interfering when crafting/smelting/mining, etc.
-          if ((bot as any).__task?.running) return;
           const hostile = Object.values(bot.entities).find((e: any) => {
             if (!e || !e.position) return false;
             if (!isHostileEntityName(e.name || e.username || e.displayName)) return false;
@@ -640,6 +642,8 @@ async function joinGame(params: Record<string, unknown>) {
             return d <= 8.0;
           });
           if (!hostile) return;
+          // Mark defense active to let task loops honor it
+          (bot as any).__defenseActive = true;
           // Equip and attack
           try {
             const dist = bot.entity.position.distanceTo(hostile.position);
@@ -649,8 +653,17 @@ async function joinGame(params: Record<string, unknown>) {
           } catch {}
           // @ts-ignore
           bot.pvp.attack(hostile);
-          const sdMs = Number(((bot as any).__selfDefense?.durationMs) ?? 10000);
-          setTimeout(() => { try { (bot as any).pvp?.stop?.(); } catch {} }, sdMs);
+          // Keep attacking while hostile remains in radius; no external task timeout advancement
+          const keepUntil = Date.now() + 30000; // hard ceiling to avoid infinite loops
+          while (Date.now() < keepUntil) {
+            const still = Object.values(bot.entities).find((e: any) => e && e.id === (hostile as any).id);
+            const nearby = still && (still as any).position && (still as any).position.distanceTo(bot.entity.position) <= 8.0;
+            if (!nearby) break;
+            await bot.waitForTicks(5);
+          }
+          try { (bot as any).pvp?.stop?.(); } catch {}
+          // Clear flag after a brief cooldown
+          setTimeout(() => { (bot as any).__defenseActive = false; }, 200);
           (bot as any).__lastDefense = { target: hostile?.name || hostile?.username || 'unknown', time: Date.now() };
         } catch {}
       }, 600);
@@ -715,11 +728,11 @@ async function goToKnownLocation(params: Record<string, unknown>) {
   let arrived = false;
   let lastProgressAt = start;
   let best = Infinity;
-  while (Date.now() - start < maxMs) {
+  while (Date.now() - start < maxMs || isDefenseActive(bot)) {
     const d = bot.entity.position.distanceTo(target);
     if (d <= Math.max(1, range) + 0.5) { arrived = true; break; }
     if (d + 0.25 < best) { best = d; lastProgressAt = Date.now(); }
-    if (Date.now() - lastProgressAt > 15000) break; // stalled
+    if (!isDefenseActive(bot) && Date.now() - lastProgressAt > 15000) break; // stalled unless defending
     await bot.waitForTicks(5);
   }
   try { bot.pathfinder.stop(); } catch {}
@@ -2030,7 +2043,7 @@ async function goToSurface(params: Record<string, unknown>) {
   const begin = Date.now();
   const maxMs = Number((params as any).maxMs ?? 90000);
   let arrived = false;
-  while (Date.now() - begin < maxMs) {
+  while (Date.now() - begin < maxMs || isDefenseActive(bot)) {
     const d = bot.entity.position.distanceTo(target);
     const near = d <= 3;
     const clear = isClearToSkyAt(bot, bot.entity.position.floored());
